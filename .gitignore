@@ -1,0 +1,28 @@
+# Foundry / build artifacts
+cache/
+out/
+broadcast/
+coverage/
+coverage.json
+lcov.info
+gas-report.txt
+
+# Dependencies are vendored git submodules — keep lib/ tracked except internal caches
+lib/*/storage-layout/
+
+# Environment / secrets (template lives in env.example)
+.env
+.env.local
+.env.production
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Foundry home if ever created locally
+.foundry/
+
+# Node (future tooling)
+node_modules/

@@ -1,0 +1,35 @@
+[profile.default]
+src = "src"
+test = "test"
+script = "script"
+out = "out"
+libs = ["lib"]
+
+# Elysium is an EVM-compatible (Substrate/Frontier) chain; avoid PUSH0-era
+# opcodes so the bytecode stays compatible with its EVM target.
+evm_version = "paris"
+solc = "0.8.24"
+
+optimizer = true
+optimizer_runs = 10_000_000
+via_ir = false
+
+remappings = [
+  "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+  "forge-std/=lib/forge-std/src/",
+]
+
+# Fast local iteration
+[profile.default.fuzz]
+runs = 256
+max_test_rejects = 65536
+
+# Thorough CI profile
+[profile.ci.fuzz]
+runs = 2000
+
+# Production-grade bytecode (max optimizations); used implicitly by `FOUNDRY_PROFILE=max forge build`
+[profile.max]
+optimizer_runs = 10_000_000
+
+# See more: docs at https://getfoundry.sh
