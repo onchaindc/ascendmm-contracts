@@ -6,6 +6,7 @@ import {console2} from "forge-std/console2.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {AscendVault} from "../src/AscendVault.sol";
 import {IStrategy} from "../src/interfaces/IStrategy.sol";
+import {IdleStrategy} from "../src/strategies/IdleStrategy.sol";
 
 /// @title DeployAscendVault
 /// @notice Deployment script for AscendVault targeting Elysium testnet.
@@ -16,9 +17,14 @@ import {IStrategy} from "../src/interfaces/IStrategy.sol";
 ///                                owner unless VAULT_OWNER is set
 ///        * ELY_UNDERLYING_ASSET   (required) underlying ERC20 asset address
 ///        * ELY_INITIAL_STRATEGY   (optional) IStrategy bound at deployment
+///        * DEPLOY_IDLE_STRATEGY   (optional, default false) deploy + bind an
+///                                 IdleStrategy for the fresh vault (ignored
+///                                 when ELY_INITIAL_STRATEGY is set)
+///        * STRATEGY_CAP           (optional) IdleStrategy cap in asset units;
+///                                 unset or 0 means unbounded
 ///        * VAULT_OWNER            (optional) owner override (e.g. multisig)
 ///        * ELY_RPC_URL            (optional) sanity-checked chain id source
-///        * ELY_CHAIN_ID           (optional, default 1338) expected chain id
+///        * ELY_CHAIN_ID           (optional, e.g. 99801) expected chain id
 contract DeployAscendVault is Script {
     // Share-token naming (kept as constants so renames stay one-line).
     string constant VAULT_NAME = "AscendMM Vault";
@@ -36,15 +42,17 @@ contract DeployAscendVault is Script {
         address underlying = vm.parseAddress(assetRaw);
         require(underlying != address(0), "ELY_UNDERLYING_ASSET cannot be zero");
 
-        // --- OPTIONAL: initial strategy and owner override ----------------
+        // --- OPTIONAL: initial strategy, fresh idle strategy, owner ------
         address initialStrategy = vm.envOr("ELY_INITIAL_STRATEGY", address(0));
+        bool deployIdleStrategy = vm.envOr("DEPLOY_IDLE_STRATEGY", false);
+        uint256 strategyCapRaw = vm.envOr("STRATEGY_CAP", uint256(0));
         address vaultOwner = vm.envOr("VAULT_OWNER", deployer);
 
         // --- Network sanity check ----------------------------------------
-        // If ELY_CHAIN_ID is set (recommended on real networks: 1338 for the
-        // Elysium Atlantis testnet per official docs), fail fast when the
-        // target RPC answers with a different chain id. Left unset, the check
-        // is skipped so plain local dry-runs (`forge script ...`) still work.
+        // If ELY_CHAIN_ID is set (recommended on real networks: 99801 for the
+        // Kinetiq Elysium testnet), fail fast when the target RPC answers
+        // with a different chain id. Left unset, the check is skipped so
+        // plain local dry-runs (`forge script ...`) still work.
         uint256 expectedChainId = vm.envOr("ELY_CHAIN_ID", uint256(0));
         if (expectedChainId != 0 && block.chainid != expectedChainId) {
             revert("chain id mismatch: the RPC answered with a different chain than ELY_CHAIN_ID");
@@ -55,6 +63,11 @@ contract DeployAscendVault is Script {
         AscendVault vault = new AscendVault(IERC20(underlying), VAULT_NAME, VAULT_SYMBOL, vaultOwner);
         if (initialStrategy != address(0)) {
             vault.setStrategy(IStrategy(initialStrategy));
+        } else if (deployIdleStrategy) {
+            uint256 strategyCap = strategyCapRaw == 0 ? type(uint256).max : strategyCapRaw;
+            IdleStrategy idle = new IdleStrategy(address(vault), IERC20(underlying), strategyCap);
+            vault.setStrategy(idle);
+            console2.log("  idle strategy:    ", address(idle));
         }
         vm.stopBroadcast();
 
@@ -65,7 +78,7 @@ contract DeployAscendVault is Script {
         console2.log("  owner:            ", vault.owner());
         console2.log("  entry fee (bps):  ", vault.entryFeeBps());
         console2.log("  exit fee (bps):   ", vault.exitFeeBps());
-        console2.log("  strategy bound:   ", initialStrategy);
+        console2.log("  strategy bound:   ", vault.strategy());
         console2.log("  chain id:         ", block.chainid);
     }
 }

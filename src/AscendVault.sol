@@ -20,9 +20,12 @@ import {IStrategy} from "./interfaces/IStrategy.sol";
 ///  * A dormant fee architecture: entry and exit fees default to 0 with no fee
 ///    recipient set, and can be enabled later by the owner without redeploying
 ///    or redesigning the vault.
-///  * A strategy binding placeholder: the vault stores an `IStrategy` address
-///    and emits `StrategyUpdated`, but no funds are ever moved to the strategy
-///    in this iteration. Active allocation is a future AscendMM milestone.
+///  * A strategy layer with vault-side accounting: the owner can bind an
+///    `IStrategy`, explicitly invest idle assets into it (`investIdle`), and
+///    pull them back (`exitStrategy`). Withdrawals automatically tap the
+///    strategy when idle balance is insufficient. Share pricing counts a
+///    vault-side investment ledger — never the strategy's self-reported
+///    balance (see {totalAssets}).
 ///
 /// @dev Status: FOUNDATION. Not audited. Intended for Elysium testnet first.
 ///      Fees and strategy accounting must be reviewed and finalized before any
@@ -60,9 +63,18 @@ contract AscendVault is ERC4626, Ownable, ReentrancyGuard {
     address private _feeRecipient;
 
     /// @notice Currently bound strategy. The zero address means "no strategy".
-    /// @dev Placeholder only. This iteration NEVER transfers funds to the
-    ///      strategy; it exists so strategy lifecycle wiring has a home.
+    /// @dev Binding never moves funds by itself; the owner explicitly invests
+    ///      idle assets via {investIdle}. The strategy is the only external
+    ///      contract called on the asset path, and every transfer is
+    ///      settlement-verified (see {investIdle} and {_withdraw}).
     IStrategy private _strategy;
+
+    /// @notice Vault-side ledger of assets currently invested in the bound
+    ///         strategy. This — not the strategy's self-reported
+    ///         `totalAssets()` — is what share pricing counts, so a
+    ///         compromised or buggy strategy cannot inflate the exchange
+    ///         rate by lying about its holdings.
+    uint256 private _strategyInvested;
 
     // ---------------------------------------------------------------------
     // Errors
@@ -86,6 +98,29 @@ contract AscendVault is ERC4626, Ownable, ReentrancyGuard {
     /// @notice Invalid fee recipient change (e.g. unsetting while fees active).
     error FeeRecipientInvalid();
 
+    /// @notice A strategy action was attempted while no strategy is bound.
+    error NoStrategySet();
+
+    /// @notice The strategy binding cannot change while vault assets remain
+    ///         invested in the current strategy. Exit first ({exitStrategy}).
+    error StrategyStillInvested(address strategy, uint256 invested);
+
+    /// @notice More idle assets were requested for investment than the vault
+    ///         currently holds.
+    error IdleBalanceTooLow(uint256 requested, uint256 idle);
+
+    /// @notice Investing the requested amount would exceed the strategy cap.
+    error StrategyCapacityExceeded(uint256 projected, uint256 cap);
+
+    /// @notice The vault balance after `invest` differs from the expected
+    ///         post-pull balance: the strategy did not settle exactly what it
+    ///         was allowed to pull. The whole operation reverts.
+    error InvestSettlementMismatch(uint256 expectedBalance, uint256 actualBalance);
+
+    /// @notice A withdrawal from the strategy settled less than required. The
+    ///         whole operation reverts, leaving accounting untouched.
+    error DivestShortfall(uint256 required, uint256 settled);
+
     // ---------------------------------------------------------------------
     // Events
     // ---------------------------------------------------------------------
@@ -101,6 +136,17 @@ contract AscendVault is ERC4626, Ownable, ReentrancyGuard {
     /// @notice Emitted when the owner updates fee configurations.
     event EntryFeeUpdated(uint64 oldFeeBps, uint64 newFeeBps);
     event ExitFeeUpdated(uint64 oldFeeBps, uint64 newFeeBps);
+
+    /// @notice Emitted when the vault invests idle assets into the strategy.
+    /// @param strategy Strategy that received the assets.
+    /// @param assets Amount invested.
+    event StrategyInvested(address indexed strategy, uint256 assets);
+
+    /// @notice Emitted when the vault pulls assets back from the strategy.
+    /// @param strategy Strategy the assets were pulled from.
+    /// @param assets Amount divested (settled amount; may exceed the ledgered
+    ///        amount if the strategy returned donated tokens as well).
+    event StrategyDivested(address indexed strategy, uint256 assets);
 
     // ---------------------------------------------------------------------
     // Constructor
@@ -124,15 +170,22 @@ contract AscendVault is ERC4626, Ownable, ReentrancyGuard {
     // ---------------------------------------------------------------------
 
     /// @notice Bind or clear the vault's strategy.
-    /// @dev Only stores the address and validates the strategy's self-reported
-    ///      bindings (`vault()` / `asset()`). Funds are NOT moved in this
-    ///      iteration; future milestones add allocation and accounting.
+    /// @dev Validates the candidate's self-reported bindings (`vault()` /
+    ///      `asset()`) against this vault. Binding never moves funds; assets
+    ///      reach the strategy only via {investIdle}. Switching or clearing is
+    ///      blocked while assets remain invested — exit first via
+    ///      {exitStrategy} so migration cannot strand or lose assets.
+    ///      Re-binding the SAME strategy is always allowed (no-op).
     ///      `setStrategy(IStrategy(address(0)))` clears the binding.
     /// @param newStrategy Candidate strategy (zero address clears).
     function setStrategy(IStrategy newStrategy) external onlyOwner {
         _validateStrategyBinding(newStrategy);
 
         IStrategy oldStrategy = _strategy;
+        if (oldStrategy != newStrategy && _strategyInvested != 0) {
+            revert StrategyStillInvested(address(oldStrategy), _strategyInvested);
+        }
+
         _strategy = newStrategy;
 
         emit StrategyUpdated(oldStrategy, newStrategy);
@@ -141,6 +194,103 @@ contract AscendVault is ERC4626, Ownable, ReentrancyGuard {
     /// @notice Currently bound strategy (zero address if none).
     function strategy() external view returns (address) {
         return address(_strategy);
+    }
+
+    /// @notice Assets the vault has currently invested in the bound strategy
+    ///         (vault-side ledger; see {totalAssets}).
+    function strategyInvested() external view returns (uint256) {
+        return _strategyInvested;
+    }
+
+    /// @notice Total assets managed by the vault: idle balance plus the
+    ///         vault-side strategy ledger.
+    /// @dev Deliberately does NOT consult the strategy's self-reported
+    ///      `totalAssets()` (see {IStrategy-totalAssets}): a compromised
+    ///      strategy could inflate it to manipulate the share price. Assets
+    ///      are counted only after the vault verifiably moved them into the
+    ///      strategy ({investIdle}) and stop being counted only after they
+    ///      verifiably return ({exitStrategy} / {_withdraw}). All ERC-4626
+    ///      conversions (previews, convert*, max*) build on this, so pricing
+    ///      stays exact for idle-style strategies.
+    function totalAssets() public view override returns (uint256) {
+        return IERC20(asset()).balanceOf(address(this)) + _strategyInvested;
+    }
+
+    // ---------------------------------------------------------------------
+    // Admin: strategy funding / exit
+    // ---------------------------------------------------------------------
+
+    /// @notice Invest idle vault assets into the bound strategy (owner-only).
+    /// @dev Deposits stay idle; binding a strategy never moves funds. The
+    ///      pull is allowance-scoped: the vault approves exactly `assets`,
+    ///      verifies that it lost exactly `assets`, then clears the approval
+    ///      — the strategy never holds a standing allowance over vault funds.
+    /// @param assets Amount of the underlying asset to invest (0 = no-op).
+    function investIdle(uint256 assets) external onlyOwner nonReentrant {
+        IStrategy strategy = _strategy;
+        if (strategy == IStrategy(address(0))) {
+            revert NoStrategySet();
+        }
+        if (assets == 0) {
+            return;
+        }
+
+        IERC20 token = IERC20(asset());
+        uint256 idle = token.balanceOf(address(this));
+        if (assets > idle) {
+            revert IdleBalanceTooLow(assets, idle);
+        }
+        uint256 projected = _strategyInvested + assets;
+        if (projected > strategy.cap()) {
+            revert StrategyCapacityExceeded(projected, strategy.cap());
+        }
+
+        // Effect before interaction: the ledger moves first; the settlement
+        // check below reverts (rolling everything back) unless the strategy
+        // pulled exactly what it was approved for.
+        _strategyInvested = projected;
+        SafeERC20.forceApprove(token, address(strategy), assets);
+        strategy.invest(assets);
+        uint256 settledBalance = token.balanceOf(address(this));
+        if (settledBalance != idle - assets) {
+            revert InvestSettlementMismatch(idle - assets, settledBalance);
+        }
+        SafeERC20.forceApprove(token, address(strategy), 0);
+
+        emit StrategyInvested(address(strategy), assets);
+    }
+
+    /// @notice Pull all vault-owned assets back from the bound strategy into
+    ///         vault idle balance (owner-only).
+    /// @dev Required before replacing or clearing a strategy that still holds
+    ///      invested assets. Requests exactly the ledgered amount and requires
+    ///      full settlement: a strategy that cannot repay makes the whole
+    ///      call revert, leaving the binding and accounting untouched. No-op
+    ///      when nothing is invested.
+    function exitStrategy() external onlyOwner nonReentrant {
+        IStrategy strategy = _strategy;
+        if (strategy == IStrategy(address(0))) {
+            revert NoStrategySet();
+        }
+
+        uint256 invested = _strategyInvested;
+        if (invested == 0) {
+            return;
+        }
+
+        IERC20 token = IERC20(asset());
+        uint256 idleBefore = token.balanceOf(address(this));
+
+        strategy.divest(invested);
+
+        uint256 settled = token.balanceOf(address(this)) - idleBefore;
+        if (settled < invested) {
+            revert DivestShortfall(invested, settled);
+        }
+
+        _strategyInvested = 0;
+
+        emit StrategyDivested(address(strategy), settled);
     }
 
     // ---------------------------------------------------------------------
@@ -224,6 +374,11 @@ contract AscendVault is ERC4626, Ownable, ReentrancyGuard {
     /// @inheritdoc ERC4626
     /// @dev Deposit/mint workflow with the entry-fee hook.
     ///
+    ///      Deposits are NOT automatically routed to the strategy: binding a
+    ///      strategy never moves funds (pinned by tests), assets accumulate
+    ///      idle, and the owner invests explicitly via {investIdle}. This
+    ///      keeps deposits gas-flat and independent of strategy state.
+    ///
     ///      `shares` is the FULL ERC-4626 share amount for the gross `assets`
     ///      entering the vault: depositors are not diluted by entry fees (the
     ///      fee is paid out of the deposited assets, not by minting extra
@@ -273,6 +428,34 @@ contract AscendVault is ERC4626, Ownable, ReentrancyGuard {
 
         // Burn shares first (effects before interactions).
         _burn(owner, shares);
+
+        IERC20 token = IERC20(asset());
+        uint256 idle = token.balanceOf(address(this));
+        if (idle < assets) {
+            // Insufficient idle liquidity: pull the shortfall from the bound
+            // strategy. The strategy is vault-gated and must settle in full,
+            // otherwise the whole redemption reverts (shares included) and
+            // no accounting changes.
+            uint256 shortfall = assets - idle;
+            IStrategy strategy = _strategy;
+            if (strategy == IStrategy(address(0))) {
+                revert DivestShortfall(assets, idle);
+            }
+
+            strategy.divest(shortfall);
+
+            uint256 settled = token.balanceOf(address(this));
+            if (settled < assets) {
+                revert DivestShortfall(assets, settled);
+            }
+
+            // Ledger decrement is floored at zero: if the strategy returned
+            // more than it was owed (e.g. donated tokens it held on top), the
+            // extra simply becomes idle balance.
+            _strategyInvested = shortfall >= _strategyInvested ? 0 : _strategyInvested - shortfall;
+
+            emit StrategyDivested(address(strategy), shortfall);
+        }
 
         uint256 fee = _calculateExitFee(assets);
         uint256 netAssets = assets - fee; // fee <= assets by construction

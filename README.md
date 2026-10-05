@@ -2,9 +2,9 @@
 
 Professional market-making and strategy-vault protocol foundation for the **Elysium / Kinetiq** ecosystem.
 
-**Status: FOUNDATION — the vault is a minimal, production-minded ERC-4626 base.** Strategy execution, market-making logic, the vault marketplace, HyperCore integration, and keeper infrastructure are intentionally **not** implemented yet (see [Scope](#scope)).
+**Status: FOUNDATION + first strategy layer — two vault tracks, each with an owner-managed strategy flow: the ERC-20 track (`AscendVault`, a production-minded ERC-4626 base) and the native-HYPE track (`AscendVaultHype`, ERC-7535 — see [Native HYPE track](#native-hype-track-erc-7535)).** The first strategies (`IdleStrategy`, `HypeIdleStrategy`) custody-hold their asset and claim no yield. Market-making logic, real yield strategies, the vault marketplace, HyperCore integration, and keeper infrastructure are intentionally **not** implemented yet (see [Scope](#scope) and [Strategy layer](#strategy-layer)).
 
-> ⚠️ **Not audited.** Intended for Elysium testnet first. Fees are disabled by default and the strategy binding is inert until a reviewed allocation design ships.
+> ⚠️ **Not audited.** Intended for Elysium testnet first. Fees are disabled by default. `IdleStrategy` / `HypeIdleStrategy` never move funds on their own and never fabricate yield; only the vault owner routes assets into them.
 
 ---
 
@@ -12,18 +12,30 @@ Professional market-making and strategy-vault protocol foundation for the **Elys
 
 ```text
 src/
-  AscendVault.sol          # ERC-4626 vault: accounting, dormant fees, strategy binding
+  AscendVault.sol          # ERC-20 track: ERC-4626 vault (accounting, dormant fees, strategy layer)
+  AscendVaultHype.sol      # Native-HYPE track: ERC-7535 vault (msg.value deposits, same strategy-layer design)
   interfaces/
-    IStrategy.sol          # Minimal strategy interface (placeholder for future milestones)
+    IStrategy.sol          # Minimal strategy interface (vault <-> strategy contract)
+    IERC4626Hype.sol       # ERC-4626-shaped interface with payable deposit/mint (ERC-7535)
+    IHypeStrategy.sol      # Native-HYPE strategy interface (HYPE-denominated, separate from IStrategy)
+  strategies/
+    IdleStrategy.sol       # ERC-20 track: idle custody of the vault asset, no yield
+    HypeIdleStrategy.sol   # Native-HYPE track: custody-holds native HYPE, no yield
 
 test/
-  AscendVault.t.sol        # Main test suite (deployment, accounting, fees, strategy, access)
+  AscendVault.t.sol        # ERC-20 vault suite (deployment, accounting, fees, strategy binding, access)
+  StrategyVault.t.sol      # ERC-20 strategy-layer suite (invest/divest flows, migration, adversarial strategies)
+  HypeVault.t.sol          # Native-HYPE suites: HypeVaultTest (32) + HypeIdleStrategyTest (5)
   mocks/
     MockERC20.sol          # Test-only ERC20 with configurable decimals (18 & 6 covered)
     MockStrategy.sol       # Test-only IStrategy implementations (valid + misbound)
+    EvilStrategies.sol     # TEST-ONLY adversarial ERC-20 strategies (greedy/lying/stingy) proving containment
+    EvilHypeStrategies.sol # TEST-ONLY adversarial native strategies (greedy/stingy/lying/reentrant/misbound)
 
 script/
-  DeployAscendVault.s.sol  # Elysium testnet deployment script (all config via env vars)
+  DeployAscendVault.s.sol  # ERC-20 vault deployment script (all config via env vars; optional fresh strategy)
+  DeployAscendVaultHype.s.sol # Native-HYPE (ERC-7535) vault + HypeIdleStrategy deployment (env-driven)
+  DeployIdleStrategy.s.sol # Dedicated IdleStrategy deploy/bind path for an EXISTING vault
   DeployTestAsset.s.sol    # TEST-ONLY mock ERC20 deployer (no documented testnet asset)
 
 foundry.toml               # Foundry configuration (solc 0.8.24, paris EVM)
@@ -43,13 +55,66 @@ Extends **OpenZeppelin v5.7 `ERC4626`** rather than reimplementing the standard:
   - `_withdraw` hook: shares are burned for the gross amount; `receiver` gets `assets − exitFee`, the recipient gets the fee. The ERC-4626 `Withdraw` event reports the gross amount.
   - Configuration: `setFeeRecipient` then `setFees(entryBps, exitBps)`. Fees are hard-capped at **10% (1_000 bps)** each, fees cannot be enabled while no recipient is set, and the recipient cannot be zeroed while any fee is active.
   - Events: `EntryFeeUpdated`, `ExitFeeUpdated`, `FeeRecipientUpdated` for indexing.
-- **Strategy placeholder** — `setStrategy(IStrategy)` stores the binding and emits `StrategyUpdated(old, new)`. Binding is validated against the strategy's self-reported `vault()` and `asset()` (`StrategyVaultMismatch` / `StrategyAssetMismatch` on mismatch). **No funds ever move to the strategy in this iteration** — that is the next milestone. Zero address clears the binding.
+- **Strategy layer** — see [Strategy layer](#strategy-layer) for the full design. In short: binding (`setStrategy`) stays validation-only and never moves funds; the owner explicitly invests idle assets (`investIdle`) and can pull everything back (`exitStrategy`); withdrawals automatically tap the strategy when idle balance is short; and share pricing counts a **vault-side investment ledger**, never the strategy's self-reported balance.
 - **Access control** — OpenZeppelin `Ownable` (initial owner set at construction; supports an immutable multisig owner). Only the owner can call `setStrategy`, `setFees`, `setFeeRecipient`; ownership is transferable via `transferOwnership`.
 - **Security** — `ReentrancyGuard` on both internal deposit/withdraw flows (guards callback-capable assets, e.g. ERC-777), effects-before-interactions ordering, `SafeERC20` for all token transfers.
 
 ### `IStrategy`
 
-Minimal interface with `vault()`, `asset()`, `cap()`, `totalAssets()`, and provisionally-signed `invest` / `divest` / `report` plus matching events. The doc comments mark exactly what is unimplemented and what a future vault iteration must validate (the vault must not trust a strategy's self-reported `totalAssets` for share pricing until a full accounting design is reviewed).
+Minimal interface with `vault()`, `asset()`, `cap()`, `totalAssets()`, and `invest` / `divest` / `report` plus matching events (`Invested`, `Divested`, `Reported`). Its doc comments pin two rules the vault enforces: implementations must restrict `invest`/`divest` to their bound vault, and the vault must never price shares off the strategy's self-reported `totalAssets()`. `report()` keeps its provisional signature (returns `int256` profit/loss) and is unused by this vault iteration.
+
+### `IdleStrategy`
+
+The first concrete strategy (`src/strategies/IdleStrategy.sol`): custody-holds the vault's underlying asset and nothing else. No lending, staking, swapping, or external protocol calls of any kind. `totalAssets()` is the raw token balance (exactly the assets attributable to the strategy), `report()` is always flat, and `invest`/`divest` are gated to the bound vault (`NotVault` otherwise). **It does not claim, simulate, or fabricate yield** — a real yield strategy must be a separately reviewed contract adopted through the migration path below.
+
+## Strategy layer
+
+How the vault and its strategy interact (implemented in `AscendVault` + `IdleStrategy`, exercised by `test/StrategyVault.t.sol`):
+
+**Trust model — vault-side ledger.** `totalAssets() = idle asset balance + _strategyInvested`, where `_strategyInvested` is the vault's own ledger of what it has verifiably moved into the strategy. The strategy's self-reported `totalAssets()` is **never** used for share pricing (the `IStrategy` doc comments forbid it): a lying or compromised strategy cannot inflate the exchange rate. For `IdleStrategy` (no yield, no fees on the asset) the ledger is always exactly accurate. Donations sent directly to the strategy are not counted anywhere — conservative by design.
+
+**Asset flow.**
+1. `deposit`/`mint` — funds stay **idle in the vault**. Binding a strategy never moves funds (pinned by `test_Strategy_NeverReceivesVaultFunds`).
+2. `investIdle(assets)` (owner) — invests idle assets into the strategy. The vault approves **exactly** `assets`, calls `strategy.invest`, verifies it lost **exactly** `assets` (`InvestSettlementMismatch` otherwise), then clears the approval. The strategy never holds a standing allowance over vault funds.
+3. `withdraw`/`redeem` — if the idle balance is insufficient, the vault pulls the shortfall from the strategy (`strategy.divest`) and verifies full settlement (`DivestShortfall` otherwise; the whole redemption reverts atomically). With fees enabled, the exit fee is still taken from the gross asset amount.
+4. `exitStrategy()` (owner) — pulls the entire ledgered amount back to vault idle; required before rebinding.
+
+**Admin permissions (all owner-only, all `nonReentrant`).**
+- `setStrategy(IStrategy)` — binds/clears; validates the strategy's self-reported `vault()`/`asset()` bindings. Blocked while assets remain invested (`StrategyStillInvested`); re-binding the same strategy is always allowed.
+- `investIdle(uint256)` — invests idle assets; reverts if the vault lacks the idle balance (`IdleBalanceTooLow`) or the strategy cap would be exceeded (`StrategyCapacityExceeded`).
+- `exitStrategy()` — pulls everything back; reverts if the strategy under-settles (`DivestShortfall`). No-op when nothing is invested.
+- Non-owners cannot move strategy funds via the vault, and non-vault callers cannot move strategy holdings (`IdleStrategy.NotVault`).
+
+**Withdrawal behavior when the strategy cannot repay.** Every strategy settlement is verified. If a strategy returns less than required — redemption or exit — the whole transaction reverts and accounting (shares, ledger, binding) is unchanged: funds are **frozen rather than silently mis-counted**. With `IdleStrategy` (which custody-holds 1:1) this cannot happen; it is the defined failure mode for future lossy strategies until a loss-realization design (`report()`) ships.
+
+**Migration.** `exitStrategy()` → `setStrategy(newStrategy)` → `investIdle(...)`. The `StrategyStillInvested` guard makes it impossible to swap or clear a strategy while assets remain invested, so migration cannot strand or lose assets. Total assets are constant through the exit (test: `test_Migration_ExitThenRebindPreservesAssets`).
+
+**No yield.** `IdleStrategy` generates nothing, claims nothing, and depends on no external protocol (no verified yield protocol exists on Kinetiq Elysium testnet). `report()` is always `0`. Any future yield-bearing strategy must identify and verify its protocol and addresses on Kinetiq Elysium before being bound.
+
+## Native HYPE track (ERC-7535)
+
+A second, independent product track (`src/AscendVaultHype.sol` + `src/strategies/HypeIdleStrategy.sol`, exercised by `test/HypeVault.t.sol`) accepts **native HYPE** — the chain's gas asset — instead of an ERC-20. It mirrors the ERC-20 strategy-layer design exactly (idle balance + vault-side investment ledger, owner-driven invest/exit, withdrawal auto-tap, dormant fees, migration guard) while adapting custody to the native token.
+
+**Why a dedicated vault.** Elysium publishes **no ERC-20 representation of HYPE** (per the Kinetiq/Elysium token-bridging docs; the canonical periphery address `0x5555…5555` was probed empty on-chain, 2026-10-05). OpenZeppelin's `ERC4626.deposit`/`mint` are `nonpayable` with `SafeERC20` transfers baked in, and Solidity forbids overriding a nonpayable interface function as `payable`. So the native vault implements a local `IERC4626Hype` interface — **identical selectors and events to ERC-4626**, except `deposit`/`mint` are declared `payable` per **ERC-7535** — and shares no code inheritance with the ERC-20 vault.
+
+**Standard compliance.**
+- `asset()` returns the **ERC-7528 native-asset sentinel** `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`.
+- Shares are 21 decimals (asset 18 + the OZ virtual offset `_decimalsOffset() = 3`), so virtual-share math makes first-deposit inflation (donation) attacks non-profitable, same as the ERC-20 track.
+- `deposit(uint256,address)` / `mint(uint256,address)` are keyed on `msg.value` (the `assets` argument must match it exactly, `HypeVaultValueMismatch` otherwise) and price against a **pre-deposit snapshot** `totalAssets() - msg.value`: the EVM credits `msg.value` before the body runs, so naive OZ-style math would price a deposit against itself. Withdraw/redeem/preview semantics are unchanged from ERC-4626.
+
+**Native-custody security model.**
+- **Gated `receive()`** — the vault's `receive()` is guarded by a `_receivingHYPE` flag that is opened *only* around a bound strategy's `divest` payout (the withdrawal shortfall path and `exitStrategy`). Any plain HYPE transfer to the vault reverts (`ReceivingUnauthorized`), so untracked value cannot enter by send — only by a forced send (e.g. `selfdestruct`), which is counted as a donation exactly like in an ERC-4626 vault (documented, tested for repricing).
+- **No self-transfers of shares** — the vault never moves its own share balance, and share minting is gated to the deposit/mint flow via a `_minting` flag (`_update` override; `HypeMintUnauthorized` / `HypeTransferUnauthorized`), defense in depth on top of `ReentrancyGuard`.
+- **Limited-stipend `call`** — every native payout (receiver, fee recipient, strategy) uses `call` with a bounded stipend, never `transfer`/`send` (the 2300-gas stipend cannot run vault or strategy logic), and reverts on failure (`HypeVaultTransferFailed`).
+- **Exact-value invest, push divest** — `investIdle` sends exactly `assets` with `strategy.invest{value: assets}` and verifies settlement (`HypeInvestSettlementMismatch`); `divest` pushes HYPE back to the vault through the gated `receive()` and reverts on shortfall (`HypeDivestShortfall`).
+
+**Accounting.** `totalAssets() = address(this).balance + _strategyInvested` — the vault's own ledger, never the strategy's self-reported `totalAssets()` (test: `LyingHypeStrategy` reporting 1e30 cannot move the share price). All errors and events are `Hype*`-prefixed (`HypeIdleBalanceTooLow`, `HypeStrategyStillInvested`, `HypeStrategyCapacityExceeded`, `HypeStrategyUpdated`, …).
+
+**Strategy flow.** Identical to the [Strategy layer](#strategy-layer): `setStrategy` validates the strategy's `vault()`/`asset()` bindings (asset must be the ERC-7528 sentinel), `investIdle`/`exitStrategy` are owner-only and `nonReentrant`, withdrawals auto-tap the strategy when idle is short, and the `HypeStrategyStillInvested` guard blocks rebinding while assets are invested.
+
+### `HypeIdleStrategy`
+
+Native counterpart of `IdleStrategy` (`src/strategies/HypeIdleStrategy.sol`): custody-holds native HYPE 1:1 — `totalAssets()` is its raw balance, `report()` is always flat, `invest`/`divest` are `onlyVault` (`NotVault` otherwise). `invest` requires `msg.value == assets` exactly (`HypeStrategyValueMismatch`), it has **no `receive()`/`fallback()`** (accidental plain transfers revert instead of being absorbed), and `divest` pushes value back with a limited-stipend `call` (`DivestShortfall` if it cannot cover the request, `HypeTransferFailed` if the vault rejects it). **It produces no yield** — same posture as `IdleStrategy`; a real-yield native strategy would be a separately reviewed contract adopted through the same migration path (`exitStrategy` → `setStrategy` → `investIdle`).
 
 ## Install
 
@@ -66,10 +131,14 @@ forge install
 ## Test
 
 ```shell
-forge test                 # full suite (40 + 2 tests, incl. 256-run fuzz)
+forge test                 # full suite (112 tests: 75 ERC-20 track [42 vault + 33 strategy-layer] + 37 native-HYPE track, incl. 256-run fuzz)
 FOUNDRY_PROFILE=ci forge test   # deeper fuzzing (2000 runs)
 forge test -vvv            # verbose
+forge test --match-contract AscendVaultStrategyTest      # ERC-20 strategy-layer suite (vault x IdleStrategy)
+forge test --match-contract IdleStrategyTest             # IdleStrategy unit tests
 forge test --match-contract AscendVaultSixDecimalsTest   # 6-decimal asset coverage
+forge test --match-contract HypeVaultTest                # native-HYPE vault suite (ERC-7535, 32 tests)
+forge test --match-contract HypeIdleStrategyTest         # HypeIdleStrategy unit tests
 ```
 
 ## Build
@@ -115,7 +184,66 @@ forge build
      --broadcast -vvvv
    ```
 
-The script deploys `AscendVault`, optionally binds `ELY_INITIAL_STRATEGY` if set, and prints a summary (vault address, asset, owner, fees, chain id).
+The script deploys `AscendVault`, optionally binds `ELY_INITIAL_STRATEGY` — or, with `DEPLOY_IDLE_STRATEGY=true`, deploys and binds a fresh `IdleStrategy` (`STRATEGY_CAP` optional) — and prints a summary (vault address, asset, owner, strategy, fees, chain id).
+
+### Deploy a fresh vault + strategy (recommended for strategy testing)
+
+```shell
+# Dry-run first, then add --broadcast
+source .env
+DEPLOY_IDLE_STRATEGY=true forge script script/DeployAscendVault.s.sol:DeployAscendVault \
+  --rpc-url "$ELY_RPC_URL"
+
+DEPLOY_IDLE_STRATEGY=true forge script script/DeployAscendVault.s.sol:DeployAscendVault \
+  --rpc-url "$ELY_RPC_URL" \
+  --private-key "$DEPLOYER_PRIVATE_KEY" \
+  --broadcast
+```
+
+After deployment, the owner routes idle assets into the strategy with:
+
+```shell
+cast send <VAULT_ADDRESS> "investIdle(uint256)" <AMOUNT_IN_ASSET_WEI> \
+  --private-key "$DEPLOYER_PRIVATE_KEY" --rpc-url "$ELY_RPC_URL"
+```
+
+### Deploy + bind a strategy for an EXISTING vault
+
+```shell
+VAULT_ADDRESS=0x3633E203A2E46C565E72d386c350ba7378384b49 BIND_STRATEGY=true \
+  forge script script/DeployIdleStrategy.s.sol:DeployIdleStrategy \
+  --rpc-url "$ELY_RPC_URL" \
+  --private-key "$DEPLOYER_PRIVATE_KEY" \
+  --broadcast
+```
+
+`BIND_STRATEGY=true` calls `setStrategy` in the same run; the broadcast key must belong to the vault owner. Leave it unset to deploy the strategy only and bind later. See the warning in the deployment record below about pre-strategy vault bytecode.
+
+### Deploy the native-HYPE vault (ERC-7535 track)
+
+The script reads `DEPLOYER_PRIVATE_KEY` itself (no `--private-key` flag is needed); the key must parse as a uint — add the `0x` prefix if your value lacks it (`export DEPLOYER_PRIVATE_KEY="0x${DEPLOYER_PRIVATE_KEY#0x}"`). It deploys `AscendVaultHype`, deploys and binds a fresh `HypeIdleStrategy` (`HYPE_STRATEGY_CAP` optional, unset/0 = unbounded), and never touches the ERC-20 track.
+
+```shell
+# Dry-run first, then add --broadcast
+source .env
+HYPE_STRATEGY_CAP=0 forge script script/DeployAscendVaultHype.s.sol:DeployAscendVaultHype \
+  --rpc-url "$ELY_RPC_URL"
+
+HYPE_STRATEGY_CAP=0 forge script script/DeployAscendVaultHype.s.sol:DeployAscendVaultHype \
+  --rpc-url "$ELY_RPC_URL" \
+  --broadcast
+```
+
+Deposits are paid in `msg.value` (no approval, no asset address):
+
+```shell
+cast send <VAULT_ADDRESS> "deposit(uint256,address)" <ASSETS_WEI> <RECEIVER> \
+  --value <ASSETS_WEI> --private-key "$DEPLOYER_PRIVATE_KEY" --rpc-url "$ELY_RPC_URL"
+
+# Route idle HYPE into the strategy (moves already-deposited funds, no value attached)
+cast send <VAULT_ADDRESS> "investIdle(uint256)" <AMOUNT_WEI> \
+  --private-key "$DEPLOYER_PRIVATE_KEY" --rpc-url "$ELY_RPC_URL"
+```
 
 ## Kinetiq Elysium testnet — target network facts
 
@@ -135,6 +263,46 @@ Target network for this deployment cycle: the **Kinetiq Elysium testnet**.
 
 ## Deployment record (Kinetiq Elysium testnet)
 
+### ERC-20 track: strategy-enabled vault + IdleStrategy — 2026-10-05
+
+Deployed via `DEPLOY_IDLE_STRATEGY=true STRATEGY_CAP=0 forge script script/DeployAscendVault.s.sol --broadcast` after a clean dry run.
+
+| Field | Value |
+| --- | --- |
+| Network | Kinetiq Elysium testnet (chain ID 99801) |
+| Vault address | `0xa49Ef74F7de5022340bE2f7DeD7bD2c54b344480` — strategy-aware bytecode (`investIdle` / `exitStrategy` / withdrawal auto-tap / vault-side ledger) |
+| Strategy address | `0xE6662124835F0927245697459fd90e77ac58329a` — `IdleStrategy` (idle custody, no yield), bound at deployment, cap unbounded (`STRATEGY_CAP=0`) |
+| Underlying asset | `0xaeB1Eb6928a1980830eEAE86e70CF751f0D4CEd6` — `asMMT`, 18 decimals, TEST-ONLY mock (same asset as the foundation deployment) |
+| Deployer / owner | `0x550C5DDab8f8D5b57275db3048d9D327Ea748D1b` |
+| Vault deploy tx | `0xbfdd65a61856805299d9bdb95e5783c01cf4ddefd78708796d8d0b93a9693149` (status `0x1`) |
+| Strategy deploy tx | `0xe1f4cc0e7dbf3323d3175a01e42a2a050576eded7273966a00d0e908bc620bf1` (status `0x1`) |
+| setStrategy tx | `0x7872b145169bd7ce619925c818816be2cddb3c2c249a878c16783a5e83fb4f7a` (status `0x1`) |
+| Verification | **NOT verified** — no explorer verification API (see [Contract verification](#contract-verification)) |
+| Smoke tests | **ALL PASSED (full strategy lifecycle)** — approve `0x13724ee454868271eaa00c98037aad59116809e3154d05ae9724f04a7b03a89b` · deposit 100 asMMT → exactly 100 shares `0x005a703755da159001d5fd59523677a2f601544c064f6b2b9452a0dad79a3a27` · `investIdle(60)` `0xc1f6c85dc5fc9075c128268165e57d10d6624eff15f180a28a74a609a038796d` · `withdraw(80)` with 40 idle → vault auto-tapped strategy for the 40 shortfall `0x6ac978889ddd9018cca12c0deae8f97842afbc85dd910fa0143a1e9a74cd6fef` · `exitStrategy()` `0x586cd563cf38cc3f462f72b6f3faa1b5da4caa2bfe372d9bbaed8db08f1f9c98` · redeem remaining 20 shares `0xa74e9c105ab4596c1d8cbcad345fb246fd3f747bb3d089621b6c7fd492a054f6` |
+
+**Post-lifecycle state (confirmed on-chain):** `totalAssets == 0`, `totalSupply == 0`, `strategyInvested == 0`, vault idle balance 0, strategy balance 0, deployer asset balance exactly restored (1,000,000 asMMT — dustless, fees 0/0 bps), and no standing ERC-20 allowances in either direction (vault→strategy 0, depositor→vault 0). Binding checks: `vault.strategy() == IdleStrategy`, `strategy.vault() == vault`, `strategy.asset() == asMMT`. Intermediate states were verified at every step (idle/strategy/ledger/totalAssets/totalSupply all matched expectations exactly). The foundation vault below was **not** touched.
+
+### Native-HYPE track: AscendVaultHype (ERC-7535) + HypeIdleStrategy — 2026-10-05
+
+Deployed via `HYPE_STRATEGY_CAP=0 forge script script/DeployAscendVaultHype.s.sol --rpc-url "$ELY_RPC_URL" --broadcast` after a clean dry run (~0.00082 HYPE gas for the three deployment txs). The ERC-20 track was not touched.
+
+| Field | Value |
+| --- | --- |
+| Network | Kinetiq Elysium testnet (chain ID 99801) |
+| Vault address | `0x8C68b40C6c553b41824F6F8d5E995FCBf809B2e7` — `AscendVaultHype` (ERC-7535 native-HYPE vault: `asset()` = ERC-7528 sentinel, payable `deposit`/`mint`, 21-decimal shares, gated `receive()`, vault-side ledger) |
+| Strategy address | `0x5bC48661a4CD27FF226295e3D226c11E7C06Ed97` — `HypeIdleStrategy` (native HYPE custody, no yield), bound at deployment, cap unbounded (`HYPE_STRATEGY_CAP=0`) |
+| Underlying asset | **Native HYPE** via the ERC-7528 sentinel `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE` — no ERC-20 HYPE wrapper exists on the testnet (per Kinetiq docs; the canonical periphery address `0x5555…5555` was probed empty on-chain 2026-10-05) |
+| Deployer / owner | `0x550C5DDab8f8D5b57275db3048d9D327Ea748D1b` |
+| Vault deploy tx | `0x4efb4dbe9e46fef02157cfd2d54eec37b7b6eeb84e2af42af09c050d89595b1f` (status `0x1`) |
+| Strategy deploy tx | `0xead43763fe62b08c8d598204cda5b848e82e6a880267291c893475a0208d0ca3` (status `0x1`) |
+| setStrategy tx | `0x44d928847ed77e8fce5e2a25347ce5866210838838412fe3c01d8b4c6e86d1d9` (status `0x1`) |
+| Verification | **NOT verified** — no explorer verification API (see [Contract verification](#contract-verification)) |
+| Smoke tests | **ALL PASSED (full strategy lifecycle)** — deposit 0.002 HYPE → 2e18 shares `0xe1231aaef6f9ac996468f4af80e6f2592a1c0a57f9bbb6be4edb169335afe95a` · `investIdle(1e15)` → strategy 1e15, ledger 1e15, totalAssets unchanged `0x43e69ff553fd1d2ff5dc51e64afb0caefd64135fa4bf7f8fd674d4257fb5e360` · `withdraw(1.5e15)` with 1e15 idle → auto-tapped strategy for the 5e14 shortfall `0xe4e4ea3fb42a3d2f83ec4cee510a50b9c119bea7a4c718180ca76024fb08ab3d` · `exitStrategy()` → strategy 0, vault idle 5e14 `0xed0b9eb0a03bba34b00e81647740a3837abaa6f04cd5a48109d5169e30bf842b` · `redeem(5e17)` shares `0x1070b2740f5429c4699eb931108862c5b67b59e1ea3ff44e71f940619c1eee9b` |
+
+**Post-lifecycle state (confirmed on-chain):** vault balance 0, strategy balance 0, `totalSupply == 0`, `totalAssets == 0`, `strategyInvested == 0` — a dust-free full roundtrip. Deployer HYPE balance 0.099580588730000000 (started 0.09993; ~0.00035 HYPE total gas across deploy + lifecycle). Binding checks: `vault.asset() == ERC-7528 sentinel`, `vault.strategy() == HypeIdleStrategy`, `strategy.vault() == vault`, share `decimals() == 21`. Intermediate states were verified after every step (idle/strategy/ledger/totalAssets/totalSupply all matched expectations exactly). **`HypeIdleStrategy` produces no yield** — it custody-holds HYPE 1:1 and claims nothing; a future real-yield native strategy would be adopted through the same migration path (`exitStrategy()` → `setStrategy(...)` → `investIdle(...)`).
+
+### Foundation deployment — 2026-10-04 (pre-strategy bytecode)
+
 | Field | Value |
 | --- | --- |
 | Network | Kinetiq Elysium testnet |
@@ -151,6 +319,8 @@ Target network for this deployment cycle: the **Kinetiq Elysium testnet**.
 | Smoke tests | **ALL PASSED** — approve `0x3a36fee42e57d80ce8b17c8d70bdc2db12e1405485e1c8553249fac48799c386` · deposit `0x21676277d27215dbc99afc15d288eb0c2e72945bad0b069bc87aa255fb48015a` (1000 asMMT → exactly 1000 shares, 1:1) · redeem `0x9468c7c44cc4284b0c514458842e2a4e1e471a49764d133d388acc2f9cd7a4f2` (dustless roundtrip; totalAssets/totalSupply back to 0) |
 
 **Status: DEPLOYED 2026-10-04.** Both contracts are live on chain 99801 (deploy txs status `0x1`), funded with 0.1 testnet HYPE via the Kinetiq faucet flow (HyperEVM drip → bridge). Post-deployment state confirmed on-chain: owner = deployer, asset bound, fees 0/0 bps with zero recipient, strategy unset, and `totalAssets`/`totalSupply` clean before and after the deposit→redeem roundtrip. Remaining gap: explorer source verification — no verification API exists (see [Contract verification](#contract-verification)). To point the vault at a real asset later, deploy a reviewed ERC20 and re-run `script/DeployAscendVault.s.sol` with that address.
+
+> ⚠️ **This deployed vault predates the strategy layer.** Its bytecode has only the placeholder `setStrategy` (validated binding, no accounting): `investIdle`/`exitStrategy` do not exist there and its `totalAssets()` is idle-only. Binding an `IdleStrategy` to it is possible but inert — that vault would never invest. For the full strategy flow, deploy a **fresh** vault (commands above) — this was done on 2026-10-05; see the strategy-enabled record above. The address above is preserved as the record of the smoke-tested foundation deployment; nothing about it has been overwritten or migrated.
 
 ## Previous deployment record — Atlantis (Elysium testnet)
 
@@ -204,6 +374,7 @@ For the Kinetiq Elysium testnet, **no verification API was found** (etherscan-st
 - Contract name: `AscendVault`
 - Compiler: `0.8.24` · EVM version: `paris` · Optimization: enabled, `10,000,000` runs
 - Full source (`src/AscendVault.sol`) and the ABI-encoded constructor arguments (asset address, `"AscendMM Vault"`, `"asMMV"`, owner address)
+- Native-HYPE track: contract name `AscendVaultHype`, constructor arguments `"AscendMM HYPE Vault"`, `"asHYPEV"`, owner address (strategy `HypeIdleStrategy`: vault address, cap)
 
 If the explorer exposes an Etherscan-style API, an equivalent CLI attempt would be:
 
@@ -220,10 +391,15 @@ Treat verification as done only when the explorer shows the source on the contra
 | Variable | Required | Purpose |
 | --- | --- | --- |
 | `DEPLOYER_PRIVATE_KEY` | ✅ | Deployer key; becomes vault owner unless `VAULT_OWNER` is set |
-| `ELY_UNDERLYING_ASSET` | ✅ | Underlying ERC20 asset address on Elysium testnet |
+| `ELY_UNDERLYING_ASSET` | ✅ | Underlying ERC20 asset address on Elysium testnet (ERC-20 track only — the native-HYPE track needs no asset address) |
 | `ELY_RPC_URL` | ✅ (for deploys) | RPC endpoint, e.g. `https://testnet-rpc.elysium.kinetiq.xyz` |
 | `ELY_CHAIN_ID` | recommended | Expected chain id — script reverts on mismatch. Target is **99801** for the Kinetiq Elysium testnet; leaving it unset skips the check (local dry-runs) |
 | `ELY_INITIAL_STRATEGY` | – | Optional `IStrategy` bound at deployment (zero/unset = none) |
+| `DEPLOY_IDLE_STRATEGY` | – | `DeployAscendVault`: deploy + bind a fresh `IdleStrategy` (default false) |
+| `STRATEGY_CAP` | – | `DeployAscendVault`: cap (asset units) for a newly deployed `IdleStrategy`; unset/0 = unbounded |
+| `HYPE_STRATEGY_CAP` | – | `DeployAscendVaultHype`: cap (wei of HYPE) for the newly deployed `HypeIdleStrategy`; unset/0 = unbounded |
+| `VAULT_ADDRESS` | ✅ (for `DeployIdleStrategy`) | Target vault for the dedicated strategy deployment path |
+| `BIND_STRATEGY` | – | `DeployIdleStrategy`: call `setStrategy` right after deploy (default false) |
 | `VAULT_OWNER` | – | Owner override (e.g. multisig); defaults to the deployer |
 
 No RPC URLs, chain IDs, explorers, or token addresses are hardcoded in the scripts; `env.example` documents reference values for the Kinetiq Elysium testnet (`https://testnet-rpc.elysium.kinetiq.xyz`, chain id `99801`, explorer `https://elysium.kinetiq.xyz/testnet-explorer`, faucet `https://elysium.kinetiq.xyz/testnet-faucet`). Verify all of them before deploying.
@@ -232,7 +408,7 @@ No RPC URLs, chain IDs, explorers, or token addresses are hardcoded in the scrip
 
 Deliberately **excluded** from this foundation (future AscendMM milestones):
 
-- Strategy execution / allocation / strategy accounting (only binding + events exist)
+- Real yield strategies / allocation logic (`IdleStrategy` / `HypeIdleStrategy` custody-hold only; see [Strategy layer](#strategy-layer) and [Native HYPE track](#native-hype-track-erc-7535))
 - Performance-fee logic beyond the dormant entry/exit fee hooks
 - Market-making algorithms
 - HyperCore integration
@@ -246,7 +422,7 @@ Deliberately **excluded** from this foundation (future AscendMM milestones):
 - **EVM compatibility**: `foundry.toml` keeps `evm_version = "paris"` — conservative, avoiding `PUSH0`-era opcodes on EVM-compatible chains; only bump to `cancun` if Kinetiq's EVM target confirms support.
 - **Verification** uses the Kinetiq testnet explorer at `https://elysium.kinetiq.xyz/testnet-explorer` — confirm its method before attempting (see [Contract verification](#contract-verification)). Do not assume the Atlantis Blockscout method applies.
 - **Previous notes**: earlier work targeted the Atlantis Elysium testnet (chain id 1338, RPC `https://rpc.atlantischain.network`, explorer/blockscout `*.atlantischain.network`, gas token ELY, faucet `https://faucet.atlantischain.network`). That network surface was not reachable from this environment at the time; the records are preserved below for traceability.
-- **Share-token naming** is hardcoded in the deploy script (`"AscendMM Vault"` / `"asMMV"`) — adjust before deploying with the real asset.
+- **Share-token naming** is hardcoded in the deploy scripts (ERC-20: `"AscendMM Vault"` / `"asMMV"`; native-HYPE: `"AscendMM HYPE Vault"` / `"asHYPEV"`) — adjust before deploying with the real asset.
 - **Ownership**: a single EOA/multisig owner can retarget fees and strategy. A multisig / timelock is strongly recommended before fees or strategies are enabled; consider `Ownable2Step` if ownership transfer abuse is a concern.
 - **Donation/slippage**: virtual-share math makes inflation attacks non-profitable but depositors should still use previews + slippage protection off-chain (standard ERC-4626 guidance, see OZ docs).
 - **Entry-fee share minting choice**: with an entry fee enabled, depositors still receive the full gross share amount (fee taken from assets, not shares). This keeps preview math standard-compliant; if a "fee shares" model is preferred instead, the hooks must be redesigned before enabling fees.
