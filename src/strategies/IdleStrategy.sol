@@ -27,6 +27,8 @@ import {IStrategy} from "../interfaces/IStrategy.sol";
 ///            tokens were delivered ahead of the call).
 ///          * `divest(assets)` — strategy → vault. The strategy pushes the
 ///            tokens back to the vault (no allowance needed in this direction).
+///          * `divestAll()` — strategy → vault. The strategy pushes its ENTIRE
+///            balance back to the vault (same mechanics as `divest`).
 ///
 /// @dev `cap()` is enforced by the vault against its own investment ledger
 ///      before `invest` is ever called. The strategy trusts exactly one
@@ -112,8 +114,11 @@ contract IdleStrategy is IStrategy {
     /// @inheritdoc IStrategy
     /// @dev Pull model: the vault approves exactly `assets` right before this
     ///      call and verifies afterwards that it lost exactly `assets`, so a
-    ///      partial pull can never corrupt the vault's accounting.
-    function invest(uint256 assets) external onlyVault {
+    ///      partial pull can never corrupt the vault's accounting. The
+    ///      function is `payable` to satisfy the unified interface (native
+    ///      strategies receive value here); the ERC-20 vault never attaches
+    ///      any, and this implementation ignores `msg.value` entirely.
+    function invest(uint256 assets) external payable onlyVault {
         SafeERC20.safeTransferFrom(_token, msg.sender, address(this), assets);
         emit Invested(assets);
     }
@@ -127,6 +132,27 @@ contract IdleStrategy is IStrategy {
         }
         SafeERC20.safeTransfer(_token, msg.sender, assets);
         emit Divested(assets);
+    }
+
+    /// @notice Return the ENTIRE token balance to the caller (the vault).
+    /// @dev Same push mechanics as {divest}: `safeTransfer`, revert above
+    ///      holdings, and {Divested} emitted with the amount actually sent.
+    ///      A zero balance is an idempotent no-op (emits `Divested(0)`).
+    function divestAll() external onlyVault {
+        uint256 held = _token.balanceOf(address(this));
+        if (held != 0) {
+            SafeERC20.safeTransfer(_token, msg.sender, held);
+        }
+        emit Divested(held);
+    }
+
+    /// @notice No-op claim: idle custody earns nothing, so this always emits
+    ///         a flat {Reported}(0). It never simulates or fabricates yield.
+    /// @dev Restricted to the bound vault like every other state-changing
+    ///      entry point. Vaults MUST NOT change share pricing off this event
+    ///      (same rule as {report}).
+    function harvest() external onlyVault {
+        emit Reported(0);
     }
 
     /// @inheritdoc IStrategy

@@ -38,7 +38,7 @@ contract GreedyPullStrategy is IStrategy {
         return _token.balanceOf(address(this));
     }
 
-    function invest(uint256 assets) external {
+    function invest(uint256 assets) external payable {
         SafeERC20.safeTransferFrom(_token, msg.sender, address(this), assets * 2);
         emit Invested(assets * 2);
     }
@@ -46,6 +46,18 @@ contract GreedyPullStrategy is IStrategy {
     function divest(uint256 assets) external {
         SafeERC20.safeTransfer(_token, msg.sender, assets);
         emit Divested(assets);
+    }
+
+    function divestAll() external {
+        uint256 held = _token.balanceOf(address(this));
+        if (held != 0) {
+            SafeERC20.safeTransfer(_token, msg.sender, held);
+        }
+        emit Divested(held);
+    }
+
+    function harvest() external {
+        emit Reported(0);
     }
 
     function report() external returns (int256) {
@@ -77,7 +89,7 @@ contract StingyDivestStrategy is IStrategy {
         return _token.balanceOf(address(this));
     }
 
-    function invest(uint256 assets) external {
+    function invest(uint256 assets) external payable {
         SafeERC20.safeTransferFrom(_token, msg.sender, address(this), assets);
         emit Invested(assets);
     }
@@ -85,6 +97,19 @@ contract StingyDivestStrategy is IStrategy {
     function divest(uint256 assets) external {
         SafeERC20.safeTransfer(_token, msg.sender, assets / 2);
         emit Divested(assets / 2);
+    }
+
+    /// @dev Stingy on the full-balance path too: returns only half.
+    function divestAll() external {
+        uint256 held = _token.balanceOf(address(this));
+        if (held != 0) {
+            SafeERC20.safeTransfer(_token, msg.sender, held / 2);
+        }
+        emit Divested(held / 2);
+    }
+
+    function harvest() external {
+        emit Reported(0);
     }
 
     function report() external returns (int256) {
@@ -116,7 +141,7 @@ contract HalfSettlingStrategy is IStrategy {
         return _token.balanceOf(address(this));
     }
 
-    function invest(uint256 assets) external {
+    function invest(uint256 assets) external payable {
         SafeERC20.safeTransferFrom(_token, msg.sender, address(this), assets / 2);
         emit Invested(assets / 2);
     }
@@ -124,6 +149,18 @@ contract HalfSettlingStrategy is IStrategy {
     function divest(uint256 assets) external {
         SafeERC20.safeTransfer(_token, msg.sender, assets);
         emit Divested(assets);
+    }
+
+    function divestAll() external {
+        uint256 held = _token.balanceOf(address(this));
+        if (held != 0) {
+            SafeERC20.safeTransfer(_token, msg.sender, held);
+        }
+        emit Divested(held);
+    }
+
+    function harvest() external {
+        emit Reported(0);
     }
 
     function report() external returns (int256) {
@@ -156,7 +193,7 @@ contract LyingStrategy is IStrategy {
         return 1e30;
     }
 
-    function invest(uint256 assets) external {
+    function invest(uint256 assets) external payable {
         SafeERC20.safeTransferFrom(_token, msg.sender, address(this), assets);
         emit Invested(assets);
     }
@@ -164,6 +201,18 @@ contract LyingStrategy is IStrategy {
     function divest(uint256 assets) external {
         SafeERC20.safeTransfer(_token, msg.sender, assets);
         emit Divested(assets);
+    }
+
+    function divestAll() external {
+        uint256 held = _token.balanceOf(address(this));
+        if (held != 0) {
+            SafeERC20.safeTransfer(_token, msg.sender, held);
+        }
+        emit Divested(held);
+    }
+
+    function harvest() external {
+        emit Reported(0);
     }
 
     function report() external returns (int256) {

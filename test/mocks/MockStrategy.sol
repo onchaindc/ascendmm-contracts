@@ -34,7 +34,7 @@ contract MockStrategy is IStrategy {
         _reportedProfit = profit;
     }
 
-    function invest(uint256 assets) external {
+    function invest(uint256 assets) external payable {
         SafeERC20.safeTransferFrom(_asset, msg.sender, address(this), assets);
         emit Invested(assets);
     }
@@ -42,6 +42,18 @@ contract MockStrategy is IStrategy {
     function divest(uint256 assets) external {
         SafeERC20.safeTransfer(_asset, msg.sender, assets);
         emit Divested(assets);
+    }
+
+    function divestAll() external {
+        uint256 held = _asset.balanceOf(address(this));
+        if (held != 0) {
+            SafeERC20.safeTransfer(_asset, msg.sender, held);
+        }
+        emit Divested(held);
+    }
+
+    function harvest() external {
+        emit Reported(_reportedProfit);
     }
 
     function report() external returns (int256 profit) {
@@ -68,11 +80,19 @@ contract MisboundStrategy is IStrategy {
         return 0;
     }
 
-    function invest(uint256) external pure {
+    function invest(uint256) external payable {
         revert("unused");
     }
 
     function divest(uint256) external pure {
+        revert("unused");
+    }
+
+    function divestAll() external pure {
+        revert("unused");
+    }
+
+    function harvest() external pure {
         revert("unused");
     }
 

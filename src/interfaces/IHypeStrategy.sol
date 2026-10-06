@@ -1,44 +1,37 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {IStrategy} from "./IStrategy.sol";
+
 /// @title IHypeStrategy
-/// @notice Native-asset counterpart of AscendMM's ERC-20 `IStrategy`: the
+/// @notice Native-asset specialization of AscendMM's unified {IStrategy}: the
 ///         minimal surface {AscendVaultHype} needs to custody native HYPE.
-/// @dev Deliberately a separate interface. The ERC-20 `IStrategy` is
-///      hard-wired to ERC-20 transfer assumptions: `invest` pulls tokens via
-///      `transferFrom` against a vault-granted allowance and `divest` pushes
-///      tokens with `safeTransfer`. Native HYPE moves as `msg.value` and has
-///      no allowance concept, so reusing `IStrategy` would force unsafe
-///      reinterpretations of its documented contract. The ERC-20 track
-///      (`AscendVault` + `IStrategy` + `IdleStrategy`) stays untouched and
-///      fully independent; only the signature shape (views + invest/divest/
-///      report) is mirrored so the proven vault-side trust model ports 1:1.
-interface IHypeStrategy {
-    // ------------------------------------------------------------------
-    // View functions
-    // ------------------------------------------------------------------
-
-    /// @notice Address of the vault this strategy is bound to.
-    function vault() external view returns (address);
-
+/// @dev Deliberately a separate, narrower interface rather than a reuse of the
+///      ERC-20 contract: the unified {IStrategy} fixes only signatures and
+///      trust rules, while the native track pins the transfer mechanism to
+///      the native pull model (`msg.value == assets` exactly). Since
+///      Solidity 0.8.24 forbids mutability changes in overrides in BOTH
+///      directions, {IStrategy.invest} is declared `payable` (the native
+///      shape) and this interface re-declares it unchanged to document the
+///      native contract; ERC-20 implementations keep their `invest` payable
+///      only to satisfy the base interface while ignoring native value. Every
+///      other function is inherited unmodified from {IStrategy}, and the
+///      shared events are declared once there (re-declaring them in an
+///      inheriting interface causes compile errors). The ERC-20 track
+///      (`AscendVault` + `IStrategy` + `IdleStrategy`) keeps its behavior;
+///      only the signature shape is unified so both tracks recognize one base
+///      interface. Vault-side trust rules port 1:1: implementers MUST
+///      restrict invest/divest/divestAll to their bound vault, and the vault
+///      must never price shares off the strategy's self-reported
+///      `totalAssets()`.
+interface IHypeStrategy is IStrategy {
     /// @notice Underlying asset the strategy operates on. Native-asset
     ///         strategies report the ERC-7528 sentinel:
     ///         0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE
+    /// @dev Re-declared to pin native-asset documentation onto the inherited
+    ///      ERC-20-generalized signature; `IHypeStrategy.asset` remains
+    ///      selector-identical to `IStrategy.asset`.
     function asset() external view returns (address);
-
-    /// @notice Upper bound (in wei of HYPE) the strategy is allowed to manage.
-    function cap() external view returns (uint256);
-
-    /// @notice Amount of native HYPE currently managed by the strategy, as
-    ///         reported by the strategy itself (raw balance).
-    /// @dev Informational only. The vault MUST NOT use this value for share
-    ///      pricing — the same rule as the ERC-20 track. Share pricing counts
-    ///      the vault's own investment ledger, never a strategy self-report.
-    function totalAssets() external view returns (uint256);
-
-    // ------------------------------------------------------------------
-    // State-changing functions
-    // ------------------------------------------------------------------
 
     /// @notice Receive exactly `assets` wei of native HYPE from the caller
     ///         (expected to be the vault).
@@ -58,24 +51,4 @@ interface IHypeStrategy {
     ///      to `vault()`.
     /// @param assets Amount of native HYPE to return.
     function divest(uint256 assets) external;
-
-    /// @notice Report realized profit (positive) or loss (negative) since the
-    ///         last report, denominated in wei of HYPE.
-    /// @dev Informational only; the vault does not rely on it. Mirrors the
-    ///      ERC-20 `IStrategy.report` shape.
-    /// @return profit Signed profit (>= 0) or loss (< 0) in wei of HYPE.
-    function report() external returns (int256 profit);
-
-    // ------------------------------------------------------------------
-    // Events
-    // ------------------------------------------------------------------
-
-    /// @notice Emitted when the strategy receives invested native HYPE.
-    event Invested(uint256 assets);
-
-    /// @notice Emitted when the strategy returns native HYPE to the vault.
-    event Divested(uint256 assets);
-
-    /// @notice Emitted after a profit/loss report.
-    event Reported(int256 profit);
 }

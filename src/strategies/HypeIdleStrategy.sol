@@ -1,17 +1,22 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {IStrategy} from "../interfaces/IStrategy.sol";
 import {IHypeStrategy} from "../interfaces/IHypeStrategy.sol";
 
 /// @title HypeIdleStrategy
 /// @notice First native-asset AscendMM strategy: custody-holds native HYPE
 ///         (the Elysium gas asset) and nothing else. Native counterpart of
 ///         the ERC-20 `IdleStrategy`, bound to {AscendVaultHype}.
+///         Implements {IHypeStrategy} — the native specialization of the
+///         unified {IStrategy} — so it satisfies the same strategy surface as
+///         every other AscendMM strategy.
 ///
 ///         Deliberately simple and safe:
 ///          * No lending, staking, swapping, or ANY external protocol.
 ///          * No yield is generated, claimed, or simulated — `report()` is
-///            always flat (0). There is NO fake APY anywhere in this contract.
+///            always flat (0) and `harvest()` is a no-op that reports 0.
+///            There is NO fake APY anywhere in this contract.
 ///          * Value moves only between this strategy and the vault it is
 ///            bound to ({onlyVault}).
 ///          * `totalAssets()` is the raw native balance of this contract.
@@ -24,20 +29,24 @@ import {IHypeStrategy} from "../interfaces/IHypeStrategy.sol";
 ///            HYPE revert instead of being silently absorbed.
 ///          * {divest} pushes value back to the vault (msg.sender) with a
 ///            limited-stipend `call` and reverts on failure, so a failed
-///            exit can never strand accounting.
+///            exit can never strand accounting. {divestAll} uses the same
+///            mechanism for the entire balance.
 ///
 /// @dev `cap()` is enforced by the vault against its own investment ledger
 ///      before `invest` is ever called. A real yield strategy would later
 ///      replace this contract via the vault's exit-then-bind migration path.
+///      Behavioral note: the pre-existing functions (bindings, errors,
+///      checks, events) are behavior-preserved exactly — this contract is
+///      deployed on Kinetiq Elysium testnet.
 contract HypeIdleStrategy is IHypeStrategy {
     // ---------------------------------------------------------------------
     // Immutable bindings
     // ---------------------------------------------------------------------
 
-    /// @inheritdoc IHypeStrategy
+    /// @inheritdoc IStrategy
     address public immutable override vault;
 
-    /// @inheritdoc IHypeStrategy
+    /// @inheritdoc IStrategy
     uint256 public immutable override cap;
 
     // ---------------------------------------------------------------------
@@ -98,7 +107,7 @@ contract HypeIdleStrategy is IHypeStrategy {
         return 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
     }
 
-    /// @inheritdoc IHypeStrategy
+    /// @inheritdoc IStrategy
     /// @dev Raw native balance of this contract — the true amount attributable
     ///      to the strategy. Note: because the vault prices shares from its
     ///      own ledger (never this value), a forced donation of HYPE here
@@ -139,7 +148,33 @@ contract HypeIdleStrategy is IHypeStrategy {
         emit Divested(assets);
     }
 
-    /// @inheritdoc IHypeStrategy
+    /// @notice Return the ENTIRE native balance to the caller (the vault).
+    /// @inheritdoc IStrategy
+    /// @dev Same push mechanics as {divest}: limited-stipend `call`, revert
+    ///      on failure, and {Divested} emitted with the amount actually sent.
+    ///      A zero balance is an idempotent no-op (emits `Divested(0)`).
+    function divestAll() external onlyVault {
+        uint256 held = address(this).balance;
+        if (held != 0) {
+            (bool ok,) = msg.sender.call{value: held}(new bytes(0));
+            if (!ok) {
+                revert HypeTransferFailed(held);
+            }
+        }
+        emit Divested(held);
+    }
+
+    /// @notice No-op claim: idle custody of native HYPE earns nothing, so
+    ///         this always emits a flat {Reported}(0). It never simulates or
+    ///         fabricates yield.
+    /// @dev Restricted to the bound vault like every other state-changing
+    ///      entry point. Vaults MUST NOT change share pricing off this event
+    ///      (same rule as {report}).
+    function harvest() external onlyVault {
+        emit Reported(0);
+    }
+
+    /// @inheritdoc IStrategy
     /// @dev Always flat: idle custody earns nothing and claims nothing.
     function report() external returns (int256 profit) {
         profit = 0;

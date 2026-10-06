@@ -42,6 +42,14 @@ contract GreedyHypeStrategy is IHypeStrategy {
         revert("greedy: no divest");
     }
 
+    function divestAll() external pure {
+        revert("greedy: no divest");
+    }
+
+    function harvest() external pure {
+        revert("greedy: no harvest");
+    }
+
     function report() external pure returns (int256) {
         revert("unused");
     }
@@ -78,6 +86,20 @@ contract StingyHypeDivestStrategy is IHypeStrategy {
         emit Divested(assets / 2);
     }
 
+    /// @dev Return the entire balance (still honest for full-balance requests).
+    function divestAll() external {
+        uint256 held = address(this).balance;
+        if (held != 0) {
+            (bool ok,) = msg.sender.call{value: held}(new bytes(0));
+            require(ok, "send failed");
+        }
+        emit Divested(held);
+    }
+
+    function harvest() external {
+        emit Reported(0);
+    }
+
     function report() external pure returns (int256) {
         revert("unused");
     }
@@ -111,6 +133,19 @@ contract LyingHypeStrategy is IHypeStrategy {
         (bool ok,) = msg.sender.call{value: assets}(new bytes(0));
         require(ok, "send failed");
         emit Divested(assets);
+    }
+
+    function divestAll() external {
+        uint256 held = address(this).balance;
+        if (held != 0) {
+            (bool ok,) = msg.sender.call{value: held}(new bytes(0));
+            require(ok, "send failed");
+        }
+        emit Divested(held);
+    }
+
+    function harvest() external {
+        emit Reported(0);
     }
 
     function report() external pure returns (int256) {
@@ -186,6 +221,20 @@ contract ReentrantHypeStrategy is IHypeStrategy {
         emit Divested(assets);
     }
 
+    /// @dev Honest full-balance return with the same gate assumptions.
+    function divestAll() external {
+        uint256 held = address(this).balance;
+        if (held != 0) {
+            (bool sent,) = msg.sender.call{value: held}(new bytes(0));
+            require(sent, "repay failed");
+        }
+        emit Divested(held);
+    }
+
+    function harvest() external {
+        emit Reported(0);
+    }
+
     /// @dev Accept value back; this mock needs no vault gate.
     receive() external payable {}
 
@@ -223,6 +272,14 @@ contract MisboundHypeStrategy is IHypeStrategy {
     }
 
     function divest(uint256) external pure {
+        revert("unused");
+    }
+
+    function divestAll() external pure {
+        revert("unused");
+    }
+
+    function harvest() external pure {
         revert("unused");
     }
 

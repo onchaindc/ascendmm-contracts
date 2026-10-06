@@ -2,7 +2,7 @@
 
 Professional market-making and strategy-vault protocol foundation for the **Elysium / Kinetiq** ecosystem.
 
-**Status: FOUNDATION + first strategy layer — two vault tracks, each with an owner-managed strategy flow: the ERC-20 track (`AscendVault`, a production-minded ERC-4626 base) and the native-HYPE track (`AscendVaultHype`, ERC-7535 — see [Native HYPE track](#native-hype-track-erc-7535)).** The first strategies (`IdleStrategy`, `HypeIdleStrategy`) custody-hold their asset and claim no yield. Market-making logic, real yield strategies, the vault marketplace, HyperCore integration, and keeper infrastructure are intentionally **not** implemented yet (see [Scope](#scope) and [Strategy layer](#strategy-layer)).
+**Status: FOUNDATION + first strategy layer — two vault tracks, each with an owner-managed strategy flow: the ERC-20 track (`AscendVault`, a production-minded ERC-4626 base) and the native-HYPE track (`AscendVaultHype`, ERC-7535 — see [Native HYPE track](#native-hype-track-erc-7535)).** The first strategies (`IdleStrategy`, `HypeIdleStrategy`) custody-hold their asset and claim no yield. A `KinetiqLstStrategy` adapter for Kinetiq's kHYPE liquid staking is implemented against Kinetiq's OFFICIAL integration interfaces but deliberately stays UNREGISTERED and INACTIVE until an official Kinetiq deployment exists on Elysium (chain 99801) — see [Kinetiq kHYPE adapter](#kinetiq-khype-adapter-prepared-inactive). Owner-controlled `StrategyRegistry` and `VaultRegistry` contracts provide bookkeeping-only directories (allowlist, risk classifications, version metadata) for the multi-vault / multi-strategy roadmap — see [Strategy registry](#strategy-registry) and [Vault registry](#vault-registry). Market-making logic, real yield strategies, the vault marketplace, HyperCore integration, and keeper infrastructure are intentionally **not** implemented yet (see [Scope](#scope) and [Strategy layer](#strategy-layer)).
 
 > ⚠️ **Not audited.** Intended for Elysium testnet first. Fees are disabled by default. `IdleStrategy` / `HypeIdleStrategy` never move funds on their own and never fabricate yield; only the vault owner routes assets into them.
 
@@ -14,23 +14,31 @@ Professional market-making and strategy-vault protocol foundation for the **Elys
 src/
   AscendVault.sol          # ERC-20 track: ERC-4626 vault (accounting, dormant fees, strategy layer)
   AscendVaultHype.sol      # Native-HYPE track: ERC-7535 vault (msg.value deposits, same strategy-layer design)
+  StrategyRegistry.sol     # Owner-controlled allowlist of approved strategies (both tracks) with risk/version metadata
+  VaultRegistry.sol        # Owner-controlled directory of vaults (asset, strategy, risk class, active flag)
   interfaces/
-    IStrategy.sol          # Minimal strategy interface (vault <-> strategy contract)
+    IStrategy.sol          # Unified strategy interface (both tracks: vault/asset/cap/totalAssets, invest/divest/divestAll/harvest/report)
     IERC4626Hype.sol       # ERC-4626-shaped interface with payable deposit/mint (ERC-7535)
-    IHypeStrategy.sol      # Native-HYPE strategy interface (HYPE-denominated, separate from IStrategy)
+    IHypeStrategy.sol      # Native-HYPE specialization of IStrategy (pins the native pull model)
+    IKinetiqStaking.sol    # Verbatim transcription of Kinetiq's official kHYPE integration interfaces (IStakingManager / IStakingAccountant / IKHYPE)
   strategies/
     IdleStrategy.sol       # ERC-20 track: idle custody of the vault asset, no yield
     HypeIdleStrategy.sol   # Native-HYPE track: custody-holds native HYPE, no yield
+    KinetiqLstStrategy.sol # Native-HYPE adapter for Kinetiq kHYPE (OFFICIAL interfaces; unregistered/inactive until a real Elysium deployment)
 
 test/
   AscendVault.t.sol        # ERC-20 vault suite (deployment, accounting, fees, strategy binding, access)
   StrategyVault.t.sol      # ERC-20 strategy-layer suite (invest/divest flows, migration, adversarial strategies)
   HypeVault.t.sol          # Native-HYPE suites: HypeVaultTest (32) + HypeIdleStrategyTest (5)
+  KinetiqLstStrategy.t.sol # Kinetiq adapter suites: KinetiqStrategyTest (34) + KinetiqVaultLifecycleTest (11, full AscendVaultHype lifecycle)
+  StrategyRegistry.t.sol   # Registry suites (ERC-20 + native registration, lifecycle, admin) + IStrategy compliance tests
+  VaultRegistry.t.sol      # Vault-registry suites (registration/validation, strategy cross-checks, lifecycle, metadata)
   mocks/
     MockERC20.sol          # Test-only ERC20 with configurable decimals (18 & 6 covered)
     MockStrategy.sol       # Test-only IStrategy implementations (valid + misbound)
     EvilStrategies.sol     # TEST-ONLY adversarial ERC-20 strategies (greedy/lying/stingy) proving containment
     EvilHypeStrategies.sol # TEST-ONLY adversarial native strategies (greedy/stingy/lying/reentrant/misbound)
+    KinetiqMocks.sol       # TEST-ONLY Kinetiq doubles: MockKHYPE / MockStakingAccountant / MockStakingManager (switchable malformed-response failure modes)
 
 script/
   DeployAscendVault.s.sol  # ERC-20 vault deployment script (all config via env vars; optional fresh strategy)
@@ -61,11 +69,11 @@ Extends **OpenZeppelin v5.7 `ERC4626`** rather than reimplementing the standard:
 
 ### `IStrategy`
 
-Minimal interface with `vault()`, `asset()`, `cap()`, `totalAssets()`, and `invest` / `divest` / `report` plus matching events (`Invested`, `Divested`, `Reported`). Its doc comments pin two rules the vault enforces: implementations must restrict `invest`/`divest` to their bound vault, and the vault must never price shares off the strategy's self-reported `totalAssets()`. `report()` keeps its provisional signature (returns `int256` profit/loss) and is unused by this vault iteration.
+Minimal unified interface covering `vault()`, `asset()`, `cap()`, `totalAssets()`, and `invest` / `divest` / `divestAll` / `harvest` / `report` plus matching events (`Invested`, `Divested`, `Reported`). It is mechanism-agnostic: `invest` is declared `payable` (the native shape — Solidity 0.8.24 forbids mutability changes in overrides in either direction), and ERC-20 implementations keep it payable only to satisfy the interface while never touching `msg.value`; `IHypeStrategy` specializes it for the native track by pinning the exact-value pull model (`msg.value == assets`). Doc comments pin the rules the vaults enforce: implementations must restrict `invest`/`divest`/`divestAll` to their bound vault, and the vault must never price shares off the strategy's self-reported `totalAssets()`. `divestAll()` returns the strategy's entire balance to the vault (idempotent no-op at zero balance); `harvest()` claims accrued yield via a `Reported` event — zero-yield custodial strategies implement it as a flat no-op. `report()` keeps its provisional signature (returns `int256` profit/loss) and is unused by this vault iteration.
 
 ### `IdleStrategy`
 
-The first concrete strategy (`src/strategies/IdleStrategy.sol`): custody-holds the vault's underlying asset and nothing else. No lending, staking, swapping, or external protocol calls of any kind. `totalAssets()` is the raw token balance (exactly the assets attributable to the strategy), `report()` is always flat, and `invest`/`divest` are gated to the bound vault (`NotVault` otherwise). **It does not claim, simulate, or fabricate yield** — a real yield strategy must be a separately reviewed contract adopted through the migration path below.
+The first concrete strategy (`src/strategies/IdleStrategy.sol`): custody-holds the vault's underlying asset and nothing else. No lending, staking, swapping, or external protocol calls of any kind. `totalAssets()` is the raw token balance (exactly the assets attributable to the strategy), `report()` is always flat, and `invest`/`divest` are gated to the bound vault (`NotVault` otherwise). It implements the full unified surface: `divestAll()` returns the entire token balance to the vault (idempotent at zero) and `harvest()` is a vault-only flat no-op (`Reported(0)`). **It does not claim, simulate, or fabricate yield** — a real yield strategy must be a separately reviewed contract adopted through the migration path below.
 
 ## Strategy layer
 
@@ -89,7 +97,26 @@ How the vault and its strategy interact (implemented in `AscendVault` + `IdleStr
 
 **Migration.** `exitStrategy()` → `setStrategy(newStrategy)` → `investIdle(...)`. The `StrategyStillInvested` guard makes it impossible to swap or clear a strategy while assets remain invested, so migration cannot strand or lose assets. Total assets are constant through the exit (test: `test_Migration_ExitThenRebindPreservesAssets`).
 
-**No yield.** `IdleStrategy` generates nothing, claims nothing, and depends on no external protocol (no verified yield protocol exists on Kinetiq Elysium testnet). `report()` is always `0`. Any future yield-bearing strategy must identify and verify its protocol and addresses on Kinetiq Elysium before being bound.
+**No yield.** `IdleStrategy` generates nothing, claims nothing, and depends on no external protocol (no verified yield protocol exists on Kinetiq Elysium testnet). `report()` is always `0` and `harvest()` is a flat no-op. Any future yield-bearing strategy must identify and verify its protocol and addresses on Kinetiq Elysium before being bound.
+
+## Strategy registry
+
+`src/StrategyRegistry.sol` is a standalone, owner-controlled allowlist for strategies across BOTH vault tracks. For each approved strategy it records the bound vault, the underlying asset, an active/paused flag, a `bytes32` strategy-type identifier (e.g. `keccak256("ASCEND_IDLE_V1")`), and an informational label. It is directory/bookkeeping infrastructure for the multi-strategy roadmap — it never moves funds and the deployed vaults do not consult it (their binding + ledger model is unchanged).
+
+- **Registration** (`registerStrategy`, owner-only) validates the same self-reported bindings the vaults enforce, plus a vault-side cross-check: the strategy must report the given vault via `vault()`, and the strategy's `asset()` must equal the VAULT's `asset()`. Because both tracks expose `asset()` — token address on ERC-20, the ERC-7528 sentinel on native-HYPE — one unified path registers either track, and invalid strategy/vault/asset combinations (including cross-track mismatches) revert. Duplicate registration is rejected; both addresses must be deployed contracts.
+- **Lifecycle** (owner-only): `setActive` (pause/activate, explicit on idempotent calls), `setType`, `removeStrategy` (removal allows fresh re-registration). Views: `getStrategy`, `isRegistered`, `isActive`, `strategyCount`, `allStrategies`.
+- **Metadata** (owner-only): each entry defaults to risk class `RISK_LOW` and version `"V1"`; `setRiskClass` and `setVersion` update them. Risk classes are four explicit protocol buckets — `RISK_LOW` / `RISK_MEDIUM` / `RISK_HIGH` / `RISK_EXPERIMENTAL` (`bytes32` identifiers) — protocol classifications, **not** audited or quantitative risk ratings. Invalid buckets, zero versions, and same-value no-ops are rejected; every change emits `StrategyRiskUpdated` / `StrategyVersionUpdated`.
+- **Zero yield posture**: the registry makes no yield claims and approves nothing on its own; binding real funds still happens only through each vault's own `setStrategy` → `investIdle` flow.
+
+## Vault registry
+
+`src/VaultRegistry.sol` is the directory layer for a multi-vault platform: an owner-controlled registry of AscendMM vaults. For each registered vault it records the underlying asset (taken from the vault's own `asset()` — token address on the ERC-20 track, the ERC-7528 sentinel on native-HYPE), an active/paused flag, a `bytes32` vault-type identifier, the associated strategy, a risk classification, and a metadata/version identifier. Like `StrategyRegistry`, it is pure bookkeeping: it never moves or holds funds, and the deployed vaults do not consult it — their accounting and security behavior are unchanged.
+
+- **Registration** (owner-only): `registerVault` / `registerVaultWithStrategy` validate that the vault is a deployed contract whose `asset()` is callable, reject duplicates and zero vault types, and — when a strategy is supplied — that the strategy is a deployed contract reporting the vault as its own binding (`strategy.vault() == vault`) with a matching asset. When the companion `StrategyRegistry` is wired at construction and the strategy is registered there, its recorded vault binding must agree (`VaultRegistryStrategyRegistryMismatch` otherwise), keeping the two registries internally consistent; deploying `VaultRegistry` standalone (zero companion address) skips that cross-check.
+- **Lifecycle** (owner-only): `updateStrategy` (validated re-association or clear; same-strategy no-ops rejected), `setActive` (pause/activate with explicit idempotence errors), `setRiskClass`, `setMetadata`, and `removeVault` (fresh re-registration allowed). Views: `getVault`, `isRegistered`, `isActive`, `vaultCount`, `allVaults`.
+- **Risk model**: the same four explicit protocol buckets as `StrategyRegistry` (`RISK_LOW` / `RISK_MEDIUM` / `RISK_HIGH` / `RISK_EXPERIMENTAL`, `bytes32`). These are protocol classifications for operators and integrators — **not** audited, third-party, or quantitative risk ratings.
+- **Events**: `VaultRegistered`, `VaultStrategyUpdated`, `VaultActivated`, `VaultDeactivated`, `VaultRiskUpdated`, `VaultMetadataUpdated`, `VaultRemoved` — every mutation is observable, so a frontend/indexer can reconstruct registry state from events alone.
+- **Security posture**: owner-only administration (OZ `Ownable`), zero-address and contract-code checks, duplicate protection, asset/vault/strategy consistency checks, no payable surface or `receive()` (plain native transfers revert — the registry can never custody funds), and no external protocol integrations.
 
 ## Native HYPE track (ERC-7535)
 
@@ -114,7 +141,35 @@ A second, independent product track (`src/AscendVaultHype.sol` + `src/strategies
 
 ### `HypeIdleStrategy`
 
-Native counterpart of `IdleStrategy` (`src/strategies/HypeIdleStrategy.sol`): custody-holds native HYPE 1:1 — `totalAssets()` is its raw balance, `report()` is always flat, `invest`/`divest` are `onlyVault` (`NotVault` otherwise). `invest` requires `msg.value == assets` exactly (`HypeStrategyValueMismatch`), it has **no `receive()`/`fallback()`** (accidental plain transfers revert instead of being absorbed), and `divest` pushes value back with a limited-stipend `call` (`DivestShortfall` if it cannot cover the request, `HypeTransferFailed` if the vault rejects it). **It produces no yield** — same posture as `IdleStrategy`; a real-yield native strategy would be a separately reviewed contract adopted through the same migration path (`exitStrategy` → `setStrategy` → `investIdle`).
+Native counterpart of `IdleStrategy` (`src/strategies/HypeIdleStrategy.sol`): custody-holds native HYPE 1:1 — `totalAssets()` is its raw balance, `report()` is always flat, `invest`/`divest` are `onlyVault` (`NotVault` otherwise). `invest` requires `msg.value == assets` exactly (`HypeStrategyValueMismatch`), it has **no `receive()`/`fallback()`** (accidental plain transfers revert instead of being absorbed), and `divest` pushes value back with a limited-stipend `call` (`DivestShortfall` if it cannot cover the request, `HypeTransferFailed` if the vault rejects it). It now also implements the unified `IStrategy` surface via `IHypeStrategy`: `divestAll()` pushes the entire balance back to the vault (same mechanics; idempotent at zero; a direct call against the deployed vault is correctly rejected by its gated `receive()`), and `harvest()` is a vault-only flat no-op (`Reported(0)`). **It produces no yield** — same posture as `IdleStrategy`; a real-yield native strategy would be a separately reviewed contract adopted through the same migration path (`exitStrategy` → `setStrategy` → `investIdle`).
+
+## Kinetiq kHYPE adapter (prepared, inactive)
+
+`src/strategies/KinetiqLstStrategy.sol` is a production-shaped native-HYPE strategy adapter for **Kinetiq's kHYPE liquid staking protocol**, prepared for the future Elysium deployment. It is deliberately **unregistered in `StrategyRegistry` and `VaultRegistry` and bound to no live vault** until an official Kinetiq deployment exists on chain 99801: Kinetiq has published mainnet (chain 999) addresses only, and there is no Elysium kHYPE/StakingManager/StakingAccountant deployment to point at — so the adapter hardcodes no address and asserts no fake deployment.
+
+**Official interfaces only.** `src/interfaces/IKinetiqStaking.sol` is a verbatim transcription of Kinetiq's official simplified integration interfaces (`IStakingManager`, `IStakingAccountant`, `IKHYPE`), taken from the `khype.zip` bundle linked from Kinetiq's integration documentation (retrieved 2026-10-06). No signature is guessed; nothing the official bundle does not expose is used — in particular, the async withdrawal queue (`queueWithdrawal`/`confirmWithdrawal`, the ~8–9-day standard path) is NOT used by the adapter (see limitations).
+
+**Architecture** (value flow preserved end to end):
+
+```text
+HYPE → AscendVaultHype → KinetiqLstStrategy → Kinetiq StakingManager → kHYPE
+kHYPE → instantUnstake (buffer-backed, fee) → HYPE → vault (gated receive())
+```
+
+- **invest (vault-only)** — native pull (`msg.value == assets` exactly, `KinetiqStrategyValueMismatch` otherwise); forwards to `stakingManager.stake{value}` and verifies the kHYPE actually minted against the StakingAccountant's official `HYPEToKHYPE` quote, relaxed by a capped slippage tolerance (`StakeSlippageExceeded` otherwise; the whole call reverts atomically).
+- **divest (vault-only)** — synchronous settlement: serves from idle HYPE first, then instant-unstakes only the shortfall (`minHYPEOut` set to the exact shortfall; kHYPE input grossed up for the protocol's reported `unstakeFeeRate` plus the tolerance, capped at the held position) and pushes exactly `assets` back through the vault's gated `receive()`. Shortfalls revert (`DivestShortfall`, `UnstakeShortfall`); the protocol's own `minHYPEOut` check is the second enforcement layer.
+- **divestAll (vault-only)** — all-or-nothing emergency exit: instant-unstakes the entire kHYPE position (slippage-protected via `_minHYPEOut`) and pushes the whole native balance. On protocol failure the call reverts and the position stays intact in kHYPE — valued, recoverable, never stranded into a loss. Idempotent at zero.
+- **totalAssets** — idle HYPE + kHYPE valued through the official `kHYPEToHYPE` conversion. No fabricated APY: value moves only when the official exchange rate moves.
+- **harvest / report** — flat `Reported(0)` no-ops: the official interface exposes NO realized-yield operation (yield accrues implicitly via the exchange rate and is realized only on redemption). Nothing is simulated or pre-realized; the vault's share price never consults the strategy's self-report anyway (vault-side ledger).
+
+**Security model.** Immutable, zero-validated protocol dependencies (no setter can redirect calls; the external-call surface is fixed at deploy time); `onlyVault` on every value-moving entry point; `ReentrancyGuard` everywhere value moves; NO approvals ever (`stake` takes native value, `instantUnstake` burns via the protocol's burner authority); a GATED `receive()` that accepts HYPE only while an unstake settlement is in flight (plain transfers revert); limited-stipend push to the vault; every protocol response verified against an official quote before acceptance — all failures fail closed with atomic rollback.
+
+**Documented limitations (deliberately not worked around).**
+- **Async withdrawal queue**: Kinetiq's standard unstake is `queueWithdrawal` + `confirmWithdrawal` over a ~8–9-day window. The vault's divest contract is synchronous (the vault verifies settlement by measuring its own balance), so a queue cannot satisfy it — the adapter uses only the buffer-backed instant-unstake path. When the `hypeBuffer` is short, divests and `divestAll` revert (fail closed); the kHYPE position remains intact. The simplified interfaces also do not pin queued-withdrawal custody semantics (when the kHYPE is actually burned), so pending-claim accounting would require inventing a valuation — a future async-aware vault iteration can add that surface.
+- **Fee gross-up**: with a nonzero reported fee, divesting the ENTIRE kHYPE position for its full face amount cannot settle exactly (the fee is a protocol cost) — such requests revert fail-closed; partial divests absorb the fee from the grossed-up input, and gross-up surplus stays idle in the strategy (still counted, conserved).
+- **Pre-production verification**: before live use, the actual fee model, the `instantUnstake` payout path (direct push vs the documented `instantUnstakePool()`), and event signatures must be verified against the real deployment. The adapter accepts payouts from any address while its receive gate is open, so a pool-routed payout is already handled.
+
+**Tests** (`test/KinetiqLstStrategy.t.sol`, 45 tests): strategy-level suite (34) covering construction/zero-address validation, bindings, `onlyVault` access, stake/unstake conversion with minimum-output protection, every malformed-protocol failure mode (stake reverts / zero-mint / undermint, shortpay / no-pay / hidden extra fee — all fail closed with the position intact), honest reported-fee gross-up, rate-rise accounting with exact settlement and conserved surplus, no-fabricated-yield (`harvest` never moves valuation), gated receive, and the full `AscendVaultHype` lifecycle (11): binding validation, deposit→`investIdle`, withdrawal auto-tap with the vault's own settlement checks, migration to `HypeIdleStrategy` preserving total assets, cap enforcement, rebinding guards, and the vault never counting the strategy's self-report. Mock doubles (`test/mocks/KinetiqMocks.sol`) implement exactly the official interfaces with rate-driven conversion (the only yield source) and switchable failure modes.
 
 ## Install
 
@@ -131,7 +186,7 @@ forge install
 ## Test
 
 ```shell
-forge test                 # full suite (112 tests: 75 ERC-20 track [42 vault + 33 strategy-layer] + 37 native-HYPE track, incl. 256-run fuzz)
+forge test                 # full suite (218 tests: 42 ERC-20 vault + 33 ERC-20 strategy-layer + 37 native-HYPE + 45 Kinetiq kHYPE adapter + 35 strategy-registry/IStrategy + 26 vault-registry, incl. 256-run fuzz)
 FOUNDRY_PROFILE=ci forge test   # deeper fuzzing (2000 runs)
 forge test -vvv            # verbose
 forge test --match-contract AscendVaultStrategyTest      # ERC-20 strategy-layer suite (vault x IdleStrategy)
@@ -139,6 +194,9 @@ forge test --match-contract IdleStrategyTest             # IdleStrategy unit tes
 forge test --match-contract AscendVaultSixDecimalsTest   # 6-decimal asset coverage
 forge test --match-contract HypeVaultTest                # native-HYPE vault suite (ERC-7535, 32 tests)
 forge test --match-contract HypeIdleStrategyTest         # HypeIdleStrategy unit tests
+forge test --match-contract Kinetiq                      # Kinetiq kHYPE adapter suites (strategy-level + vault lifecycle)
+forge test --match-contract StrategyRegistry             # registry suites (registration, lifecycle, admin, IStrategy compliance)
+forge test --match-contract VaultRegistry                # vault-registry suites (HYPE + ERC-20 + metadata)
 ```
 
 ## Build
