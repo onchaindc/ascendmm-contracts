@@ -2,7 +2,10 @@
 
 Professional market-making and strategy-vault protocol foundation for the **Elysium / Kinetiq** ecosystem.
 
-**Status: FOUNDATION + first strategy layer — two vault tracks, each with an owner-managed strategy flow: the ERC-20 track (`AscendVault`, a production-minded ERC-4626 base) and the native-HYPE track (`AscendVaultHype`, ERC-7535 — see [Native HYPE track](#native-hype-track-erc-7535)).** The first strategies (`IdleStrategy`, `HypeIdleStrategy`) custody-hold their asset and claim no yield. A `KinetiqLstStrategy` adapter for Kinetiq's kHYPE liquid staking is implemented against Kinetiq's OFFICIAL integration interfaces but deliberately stays UNREGISTERED and INACTIVE until an official Kinetiq deployment exists on Elysium (chain 99801) — see [Kinetiq kHYPE adapter](#kinetiq-khype-adapter-prepared-inactive). Owner-controlled `StrategyRegistry` and `VaultRegistry` contracts provide bookkeeping-only directories (allowlist, risk classifications, version metadata) for the multi-vault / multi-strategy roadmap — see [Strategy registry](#strategy-registry) and [Vault registry](#vault-registry). Market-making logic, real yield strategies, the vault marketplace, HyperCore integration, and keeper infrastructure are intentionally **not** implemented yet (see [Scope](#scope) and [Strategy layer](#strategy-layer)).
+**Status: FOUNDATION + first strategy layer — two vault tracks, each with an owner-managed strategy flow: the ERC-20 track (`AscendVault`, a production-minded ERC-4626 base) and the native-HYPE track (`AscendVaultHype`, ERC-7535 — see [Native HYPE track](#native-hype-track-erc-7535)).** The first strategies (`IdleStrategy`, `HypeIdleStrategy`) custody-hold their asset and claim no yield. A `KinetiqLstStrategy` adapter for Kinetiq's kHYPE liquid staking is implemented against Kinetiq's OFFICIAL integration interfaces but deliberately stays UNREGISTERED and INACTIVE until an official Kinetiq deployment exists on Elysium (chain 99801) — see [Kinetiq kHYPE adapter](#kinetiq-khype-adapter-prepared-inactive). Owner-controlled `StrategyRegistry` and `VaultRegistry` contracts provide bookkeeping-only directories (allowlist, risk classifications, version metadata) for the multi-vault / multi-strategy roadmap — see [Strategy registry](#strategy-registry) and [Vault registry](#vault-registry).
+
+> [!NOTE]
+> **Canonical registry addresses (Phase 2D, deployed 2026-10-07):** `StrategyRegistry` = `0x14Af880C9d471C00077C9919035574d003D92bFf`, `VaultRegistry` = `0xEf46f925BCC546ECAB7Dae5DF965E3980fd4B6b8` (chain 99801, owner `0x550C5DDab8f8D5b57275db3048d9D327Ea748D1b`). Both live vault/strategy pairs are registered (risk class `RISK_LOW`, metadata `"V1"`); the Kinetiq kHYPE adapter stays unregistered/inactive. Full record + tx hashes: [Registry deployment record](#registry-layer-strategyregistry--vaultregistry--live-registration--2026-10-07). Market-making logic, real yield strategies, the vault marketplace, HyperCore integration, and keeper infrastructure are intentionally **not** implemented yet (see [Scope](#scope) and [Strategy layer](#strategy-layer)).
 
 > ⚠️ **Not audited.** Intended for Elysium testnet first. Fees are disabled by default. `IdleStrategy` / `HypeIdleStrategy` never move funds on their own and never fabricate yield; only the vault owner routes assets into them.
 
@@ -321,6 +324,32 @@ Target network for this deployment cycle: the **Kinetiq Elysium testnet**.
 
 ## Deployment record (Kinetiq Elysium testnet)
 
+### Registry layer: StrategyRegistry + VaultRegistry + live registration — 2026-10-07
+
+Deployed via `ELY_CHAIN_ID=99801 forge script script/DeployRegistries.s.sol --rpc-url "$ELY_RPC_URL" --broadcast --slow` after a clean dry run. The script deployed the two registries, then registered the pre-existing live vault/strategy pairs ON-CHAIN (strategies first, so `VaultRegistry`'s companion cross-check passes). The vaults/strategies themselves were NOT redeployed or modified — registration is pure bookkeeping; both registries hold zero HYPE (confirmed `cast balance = 0`).
+
+| Field | Value |
+| --- | --- |
+| Network | Kinetiq Elysium testnet (chain ID 99801) |
+| Deployer / registry owner | `0x550C5DDab8f8D5b57275db3048d9D327Ea748D1b` (same key as the vault deployments; all six txs status `0x1`) |
+| **StrategyRegistry** | **`0x14Af880C9d471C00077C9919035574d003D92bFf`** — deploy tx `0x9880f2b2d9c3f2e7c873a64d5ffcc6da000826d40f4aa07fac957336637ed56f`, block 4,409,921 |
+| **VaultRegistry** | **`0xEf46f925BCC546ECAB7Dae5DF965E3980fd4B6b8`** — deploy tx `0xe79a3d623748892a08ed510252f86624d42deee071c5fa6002b9b64cc747035f`, block 4,409,926 |
+| `registerStrategy` (HypeIdleStrategy) | tx `0x4d6ac7d75380dc9706c7a6123e1777af2215064fc228bd0e1d16a9cef93b71b6`, block 4,409,928 |
+| `registerStrategy` (IdleStrategy) | tx `0x518f63ebd63f6d8e8c7e93ef754d88719528546666080f6e5c7333d8d866da22`, block 4,409,933 |
+| `registerVaultWithStrategy` (HYPE vault) | tx `0xceecfb58323c46868178acd70471adc436c7225c22aa3ede66742c7fef7c4d2c`, block 4,409,945 |
+| `registerVaultWithStrategy` (asMMT vault) | tx `0xbc8515135925303d60e9436ae3db895bdc7b42d1ccbca58d65f1ac3d363ffc34`, block 4,409,947 |
+| Registered strategy #1 | `0x5bC48661a4CD27FF226295e3D226c11E7C06Ed97` (HypeIdleStrategy → HYPE vault) — label `AscendMM HypeIdleStrategy V1` |
+| Registered strategy #2 | `0xE6662124835F0927245697459fd90e77ac58329a` (IdleStrategy → asMMT vault) — label `AscendMM IdleStrategy (asMMT) V1` |
+| Registered vault #1 | `0x8C68b40C6c553b41824F6F8d5E995FCBf809B2e7` (AscendVaultHype, asset = ERC-7528 sentinel) |
+| Registered vault #2 | `0xa49Ef74F7de5022340bE2f7DeD7bD2c54b344480` (AscendVault, asset = `asMMT` `0xaeB1Eb6928a1980830eEAE86e70CF751f0D4CEd6`) |
+| Metadata (all four entries) | strategyType `keccak256("ASCEND_IDLE_V1")` = `0x3ac40faa07bbb312b07d15cd479b3032d1a0ee606715e50fdece2e81fdac9e48` · vaultTypes `keccak256("ASCEND_VAULT_HYPE_V1")` = `0xd6cc70820711bfc47ebf16620b62f19093dc39166e5bda7e930a5f718097c2ac` / `keccak256("ASCEND_VAULT_ERC20_V1")` = `0x5d03986440236de464b6285820584ae946be429acfa1b06626a4e84ee2677246` · version/metadata `bytes32("V1")` |
+| Risk classification (all four) | `keccak256("RISK_LOW")` = `0x8de6751b28757f352028c28ce8c74e64bde406dc4c8e89281aa13677fbbdcafc` — conservative default for idle-custody, zero-external-dependency strategies/vaults. **Protocol bucket only, NOT an audited rating.** |
+| Verification | **NOT explorer-verified** — no verification API exists; registry state verified directly via RPC `eth_call` (see below) |
+
+**Post-deployment on-chain verification (all via RPC, 2026-10-07):** vaultCount == 2 and strategyCount == 2; `allVaults`/`allStrategies` enumerate exactly the four addresses above; both `getVault`/`getStrategy` entries carry the exact asset/strategy/vault bindings, active flags, types, `RISK_LOW`, `"V1"` metadata/versions and labels shown above; `isActive`/`isRegistered` true for all four, false for unknown addresses. Live contracts unchanged: both vaults report their bound strategy, `asMMT` metadata, `totalAssets()==0`/`totalSupply()==0` on both tracks, idle strategies report cap = unbounded and `totalAssets()==0`. `KinetiqLstStrategy` remains **unregistered and inactive** — no kHYPE/StakingManager/StakingAccountant deployment exists on chain 99801 (mainnet-999 addresses must NOT be reused).
+
+**Frontend integration:** target `VaultRegistry 0xEf46f925BCC546ECAB7Dae5DF965E3980fd4B6b8` + `StrategyRegistry 0x14Af880C9d471C00077C9919035574d003D92bFf` on chain 99801 (`https://testnet-rpc.elysium.kinetiq.xyz`). The entries' `label`/`metadata`/`riskClass` fields are stable display metadata; discovery = `allVaults()` + `getVault(...)`, cross-checked against `StrategyRegistry.getStrategy(vaultEntry.strategy)`.
+
 ### ERC-20 track: strategy-enabled vault + IdleStrategy — 2026-10-05
 
 Deployed via `DEPLOY_IDLE_STRATEGY=true STRATEGY_CAP=0 forge script script/DeployAscendVault.s.sol --broadcast` after a clean dry run.
@@ -459,6 +488,10 @@ Treat verification as done only when the explorer shows the source on the contra
 | `VAULT_ADDRESS` | ✅ (for `DeployIdleStrategy`) | Target vault for the dedicated strategy deployment path |
 | `BIND_STRATEGY` | – | `DeployIdleStrategy`: call `setStrategy` right after deploy (default false) |
 | `VAULT_OWNER` | – | Owner override (e.g. multisig); defaults to the deployer |
+| `REGISTRY_OWNER` | – | `DeployRegistries`: owner override (e.g. multisig) for both registries; defaults to the deployer |
+| `STRATEGY_REGISTRY` | – | `DeployRegistries`: re-run profile — register against an existing `StrategyRegistry` (unset = fresh deploy) |
+| `HYPE_VAULT` / `HYPE_STRATEGY` | – | `DeployRegistries`: live native-track vault/strategy to register (defaults = 2026-10-05 HYPE vault + HypeIdleStrategy) |
+| `ERC20_VAULT` / `ERC20_STRATEGY` | – | `DeployRegistries`: live ERC-20-track vault/strategy to register (defaults = 2026-10-05 asMMT vault + IdleStrategy) |
 
 No RPC URLs, chain IDs, explorers, or token addresses are hardcoded in the scripts; `env.example` documents reference values for the Kinetiq Elysium testnet (`https://testnet-rpc.elysium.kinetiq.xyz`, chain id `99801`, explorer `https://elysium.kinetiq.xyz/testnet-explorer`, faucet `https://elysium.kinetiq.xyz/testnet-faucet`). Verify all of them before deploying.
 
