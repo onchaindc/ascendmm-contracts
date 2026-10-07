@@ -198,6 +198,13 @@ contract AscendVault is ERC4626, Ownable, ReentrancyGuard {
 
     /// @notice Assets the vault has currently invested in the bound strategy
     ///         (vault-side ledger; see {totalAssets}).
+    /// @dev Risk-controls note (Phase 2G): the internal helpers
+    ///      {_settleStrategyLedger} and {_writeOffStrategyLedger} below are
+    ///      the ONLY ledger-mutating surface ever exposed to subclasses.
+    ///      They reproduce, with no behavior change to any existing path,
+    ///      the exact decrement invariants already used by {_withdraw}.
+    ///      The deployed base vault is an independent deployment and is not
+    ///      touched by these additions.
     function strategyInvested() external view returns (uint256) {
         return _strategyInvested;
     }
@@ -471,6 +478,28 @@ contract AscendVault is ERC4626, Ownable, ReentrancyGuard {
     // ---------------------------------------------------------------------
     // Internal helpers
     // ---------------------------------------------------------------------
+
+    /// @notice Move the strategy ledger to the amount ACTUALLY settled back
+    ///         to the vault (floored at zero on over-return).
+    /// @dev Risk-controls note (Phase 2G): added for the loss-aware
+    ///      emergency-exit surface of {AscendVaultGuarded}. This is the same
+    ///      floor-decrement invariant as in {_withdraw}; no existing flow is
+    ///      modified and the deployed base vault is untouched.
+    /// @param settled Amount the strategy verifiably returned to the vault.
+    function _settleStrategyLedger(uint256 settled) internal {
+        _strategyInvested = settled >= _strategyInvested ? 0 : _strategyInvested - settled;
+    }
+
+    /// @notice Write the strategy ledger off entirely (full loss admission).
+    /// @dev Risk-controls note (Phase 2G): added for the emergency-exit
+    ///      surface of {AscendVaultGuarded}, mirroring exactly what the
+    ///      happy-path {exitStrategy} achieves when full settlement occurs
+    ///      (`_strategyInvested = 0`); here it is used only when the owner
+    ///      explicitly abandons an insolvent strategy. No existing flow is
+    ///      modified and the deployed base vault is untouched.
+    function _writeOffStrategyLedger() internal {
+        _strategyInvested = 0;
+    }
 
     /// @notice Validate a candidate strategy's self-reported bindings before
     ///         storing it. A zero address is always valid (clears the binding).

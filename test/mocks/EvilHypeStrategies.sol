@@ -243,6 +243,51 @@ contract ReentrantHypeStrategy is IHypeStrategy {
     }
 }
 
+/// @title DivestReverterHypeStrategy
+/// @notice Invests honestly (custody-holds the full attached value) but
+///         reverts on EVERY divest attempt: models a fully stuck strategy
+///         (insolvent/unavailable) used to prove the guarded vault's
+///         emergency-exit -> abandonStrategy fallback. NEVER deploy.
+contract DivestReverterHypeStrategy is IHypeStrategy {
+    address public immutable override vault;
+    uint256 public immutable override cap;
+
+    constructor(address vault_) {
+        vault = vault_;
+        cap = type(uint256).max;
+    }
+
+    function asset() external pure returns (address) {
+        return 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+    }
+
+    function totalAssets() external view returns (uint256) {
+        return address(this).balance;
+    }
+
+    function invest(uint256) external payable {
+        emit Invested(0);
+    }
+
+    function divest(uint256) external pure {
+        revert("divest unavailable");
+    }
+
+    function divestAll() external pure {
+        revert("divest unavailable");
+    }
+
+    function harvest() external {
+        emit Reported(0);
+    }
+
+    function report() external pure returns (int256) {
+        revert("unused");
+    }
+
+    receive() external payable {}
+}
+
 /// @title MisboundHypeStrategy
 /// @notice Reports WRONG bindings; the vault's binding validation must
 ///         reject both mismatched vault and mismatched (non-sentinel) asset.

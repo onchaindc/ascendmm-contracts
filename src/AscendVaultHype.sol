@@ -271,6 +271,38 @@ contract AscendVaultHype is IERC4626Hype, ERC20, Ownable, ReentrancyGuard {
     /// @notice True only inside the deposit/mint flow's share mint.
     bool private _minting;
 
+    // ------------------------------------------------------------------
+    // Risk-controls internals (Phase 2G additions; no existing flow reads
+    // or writes these helpers beyond what is shown here — they exist only
+    // for {AscendVaultHypeGuarded}, mirroring the ERC-20 track's helpers.
+    // The deployed base vault is an independent deployment, untouched.)
+    // ------------------------------------------------------------------
+
+    /// @notice Open/close the strategy-divest `receive()` gate. Same flag
+    ///         the base flows toggle directly around every strategy divest
+    ///         payout ({_withdraw} shortfall path and {exitStrategy}).
+    /// @param active True to accept incoming strategy HYPE pushes.
+    function _setReceivingHYPE(bool active) internal {
+        _receivingHYPE = active;
+    }
+
+    /// @notice Move the strategy ledger to the amount ACTUALLY settled back
+    ///         to the vault (floored at zero on over-return) — the same
+    ///         decrement invariant the base {_withdraw} applies.
+    /// @param settled Amount of native HYPE the strategy verifiably pushed
+    ///        back to the vault.
+    function _settleStrategyLedger(uint256 settled) internal {
+        _strategyInvested = settled >= _strategyInvested ? 0 : _strategyInvested - settled;
+    }
+
+    /// @notice Write the strategy ledger off entirely (full loss admission),
+    ///         mirroring what the happy-path {exitStrategy} achieves at full
+    ///         settlement; used only for the owner's explicit emergency
+    ///         abandonment of an insolvent strategy.
+    function _writeOffStrategyLedger() internal {
+        _strategyInvested = 0;
+    }
+
     // ---------------------------------------------------------------------
     // ERC-7535: asset identity + total accounting
     // ---------------------------------------------------------------------
@@ -374,12 +406,19 @@ contract AscendVaultHype is IERC4626Hype, ERC20, Ownable, ReentrancyGuard {
     ///      (msg.value is credited before the body runs).
     ///      Value can only enter through this validated path (plus the
     ///      strategy-gated `receive()` during divest payouts).
+    ///
+    ///      Risk-controls note (Phase 2G): `virtual` marker added here with
+    ///      NO behavior change so that the guarded subclass
+    ///      {AscendVaultHypeGuarded} can gate this entry. Behavior of the
+    ///      already-deployed base vault (an independent deployment) is
+    ///      untouched; this marker only shapes future source inheritance.
     /// @param assets Amount of native HYPE attached (must equal msg.value).
     /// @param receiver Account receiving the minted shares.
     /// @return shares Shares minted for the deposit.
     function deposit(uint256 assets, address receiver)
         public
         payable
+        virtual
         override(IERC4626Hype)
         nonReentrant
         returns (uint256 shares)
@@ -401,12 +440,16 @@ contract AscendVaultHype is IERC4626Hype, ERC20, Ownable, ReentrancyGuard {
     /// @dev `assets` MUST equal `msg.value` exactly. The cost is computed
     ///      against the PRE-mint totalAssets snapshot, so depositors never
     ///      pay a self-referential price.
+    ///
+    ///      Risk-controls note (Phase 2G): `virtual` added, behavior
+    ///      unchanged; see {deposit} for the full note.
     /// @param shares Shares to mint for the receiver.
     /// @param receiver Account receiving the minted shares.
     /// @return assets Amount of native HYPE taken for the minted shares.
     function mint(uint256 shares, address receiver)
         public
         payable
+        virtual
         override(IERC4626Hype)
         nonReentrant
         returns (uint256 assets)
@@ -433,7 +476,12 @@ contract AscendVaultHype is IERC4626Hype, ERC20, Ownable, ReentrancyGuard {
     ///      4. Pay the entry fee out of the freshly received value (0 by
     ///         default). Fee transfer failure reverts the deposit so no
     ///         shares can ever exist without their backing native value.
-    function _deposit(address caller, address receiver, uint256 assets, uint256 shares) internal {
+    ///
+    ///      Risk-controls note (Phase 2G): `virtual` marker added with NO
+    ///      behavior change, letting the guarded subclass
+    ///      {AscendVaultHypeGuarded} add the cap/pause gates before the
+    ///      mint. The base contract's deployment behavior is untouched.
+    function _deposit(address caller, address receiver, uint256 assets, uint256 shares) internal virtual {
         uint256 fee = _calculateEntryFee(assets);
 
         _minting = true;
@@ -456,13 +504,30 @@ contract AscendVaultHype is IERC4626Hype, ERC20, Ownable, ReentrancyGuard {
     // ---------------------------------------------------------------------
 
     /// @inheritdoc IERC4626Hype
-    function withdraw(uint256 assets, address receiver, address owner) public nonReentrant returns (uint256 shares) {
+    /// @dev Risk-controls note (Phase 2G): `virtual` added, behavior
+    ///      unchanged. A guarded subclass may hold (not cancel) redemptions
+    ///      during a wage-embargo/withdrawal-pause state; the share-burn
+    ///      embargo would apply while such a hold is active. In the base
+    ///      contract this path is exact with no state change.
+    function withdraw(uint256 assets, address receiver, address owner)
+        public
+        virtual
+        nonReentrant
+        returns (uint256 shares)
+    {
         shares = previewWithdraw(assets);
         _withdraw(_msgSender(), receiver, owner, assets, shares);
     }
 
     /// @inheritdoc IERC4626Hype
-    function redeem(uint256 shares, address receiver, address owner) public nonReentrant returns (uint256 assets) {
+    /// @dev Risk-controls note (Phase 2G): `virtual` added, behavior
+    ///      unchanged; see {withdraw} for the full note.
+    function redeem(uint256 shares, address receiver, address owner)
+        public
+        virtual
+        nonReentrant
+        returns (uint256 assets)
+    {
         assets = previewRedeem(shares);
         _withdraw(_msgSender(), receiver, owner, assets, shares);
     }
@@ -477,7 +542,15 @@ contract AscendVaultHype is IERC4626Hype, ERC20, Ownable, ReentrancyGuard {
     ///      2. Pay the exit fee (0 while dormant) using a limited-stipend
     ///         call, then the net assets: revert on any payout failure.
     ///      3. Emit the standard ERC-4626 `Withdraw` event.
-    function _withdraw(address caller, address receiver, address owner, uint256 assets, uint256 shares) internal {
+    ///
+    ///      Risk-controls note (Phase 2G): `virtual` marker added with NO
+    ///      behavior change, letting the guarded subclass
+    ///      {AscendVaultHypeGuarded} gate this flow if ever needed. The
+    ///      base contract's deployment behavior is untouched.
+    function _withdraw(address caller, address receiver, address owner, uint256 assets, uint256 shares)
+        internal
+        virtual
+    {
         if (caller != owner) {
             _spendAllowance(owner, caller, shares);
         }
@@ -540,13 +613,20 @@ contract AscendVaultHype is IERC4626Hype, ERC20, Ownable, ReentrancyGuard {
     // ERC-4626 max* views (identical semantics to the ERC-20 track)
     // ---------------------------------------------------------------------
 
-    /// @inheritdoc IERC4626Hype
-    function maxDeposit(address) public pure returns (uint256) {
+    /// @dev Risk-controls note (Phase 2G): mutability relaxed pure → view
+    ///      (return value unchanged: the unbounded default) and `virtual`
+    ///      added, so {AscendVaultHypeGuarded} can reflect its configured
+    ///      cap in these views. The deployed base vault is an independent
+    ///      deployment and is not touched by this change; view vs pure is
+    ///      ABI-state-mutability metadata only, with identical return data.
+    function maxDeposit(address) public view virtual returns (uint256) {
         return type(uint256).max;
     }
 
     /// @inheritdoc IERC4626Hype
-    function maxMint(address) public pure returns (uint256) {
+    /// @dev Risk-controls note (Phase 2G): same view/virtual relaxation as
+    ///      {maxDeposit}; unbounded default preserved.
+    function maxMint(address) public view virtual returns (uint256) {
         return type(uint256).max;
     }
 

@@ -7,6 +7,9 @@ Professional market-making and strategy-vault protocol foundation for the **Elys
 > [!NOTE]
 > **Canonical registry addresses (Phase 2D, deployed 2026-10-07):** `StrategyRegistry` = `0x14Af880C9d471C00077C9919035574d003D92bFf`, `VaultRegistry` = `0xEf46f925BCC546ECAB7Dae5DF965E3980fd4B6b8` (chain 99801, owner `0x550C5DDab8f8D5b57275db3048d9D327Ea748D1b`). Both live vault/strategy pairs are registered (risk class `RISK_LOW`, metadata `"V1"`); the Kinetiq kHYPE adapter stays unregistered/inactive. Full record + tx hashes: [Registry deployment record](#registry-layer-strategyregistry--vaultregistry--live-registration--2026-10-07). Market-making logic, real yield strategies, the vault marketplace, HyperCore integration, and keeper infrastructure are intentionally **not** implemented yet (see [Scope](#scope) and [Strategy layer](#strategy-layer)).
 
+> [!NOTE]
+> **Phase 2G (risk + capital controls):** guarded next-generation vaults (`AscendVaultGuarded`, `AscendVaultHypeGuarded`) add an owner-set total-asset cap (0 = explicit unbounded), a deposits pause (withdrawals/`investIdle` stay open), and a loss-aware emergency strategy exit — see [Capital controls & emergency model](#capital-controls--emergency-model-phase-2g). The two live deployed vaults are base deployments WITHOUT these controls; nothing was redeployed in this phase.
+
 > ⚠️ **Not audited.** Intended for Elysium testnet first. Fees are disabled by default. `IdleStrategy` / `HypeIdleStrategy` never move funds on their own and never fabricate yield; only the vault owner routes assets into them.
 
 ---
@@ -17,6 +20,8 @@ Professional market-making and strategy-vault protocol foundation for the **Elys
 src/
   AscendVault.sol          # ERC-20 track: ERC-4626 vault (accounting, dormant fees, strategy layer)
   AscendVaultHype.sol      # Native-HYPE track: ERC-7535 vault (msg.value deposits, same strategy-layer design)
+  AscendVaultGuarded.sol   # ERC-20 track, GUARDED (Phase 2G): total-asset cap, deposits pause, loss-aware emergency exit
+  AscendVaultHypeGuarded.sol # Native-HYPE track, GUARDED (Phase 2G): same controls over the ERC-7535 base
   StrategyRegistry.sol     # Owner-controlled allowlist of approved strategies (both tracks) with risk/version metadata
   VaultRegistry.sol        # Owner-controlled directory of vaults (asset, strategy, risk class, active flag)
   interfaces/
@@ -31,6 +36,8 @@ src/
 
 test/
   AscendVault.t.sol        # ERC-20 vault suite (deployment, accounting, fees, strategy binding, access)
+  AscendVaultGuarded.t.sol # Guarded ERC-20 suite (cap, pause, emergency exit, migration invariants) — 31 tests
+  AscendVaultHypeGuarded.t.sol # Guarded native-HYPE suite (same coverage) — 30 tests
   StrategyVault.t.sol      # ERC-20 strategy-layer suite (invest/divest flows, migration, adversarial strategies)
   HypeVault.t.sol          # Native-HYPE suites: HypeVaultTest (32) + HypeIdleStrategyTest (5)
   KinetiqLstStrategy.t.sol # Kinetiq adapter suites: KinetiqStrategyTest (34) + KinetiqVaultLifecycleTest (11, full AscendVaultHype lifecycle)
@@ -40,12 +47,14 @@ test/
     MockERC20.sol          # Test-only ERC20 with configurable decimals (18 & 6 covered)
     MockStrategy.sol       # Test-only IStrategy implementations (valid + misbound)
     EvilStrategies.sol     # TEST-ONLY adversarial ERC-20 strategies (greedy/lying/stingy) proving containment
-    EvilHypeStrategies.sol # TEST-ONLY adversarial native strategies (greedy/stingy/lying/reentrant/misbound)
+    EvilHypeStrategies.sol # TEST-ONLY adversarial native strategies (greedy/stingy/lying/reentrant/divest-reverter/misbound)
     KinetiqMocks.sol       # TEST-ONLY Kinetiq doubles: MockKHYPE / MockStakingAccountant / MockStakingManager (switchable malformed-response failure modes)
 
 script/
   DeployAscendVault.s.sol  # ERC-20 vault deployment script (all config via env vars; optional fresh strategy)
   DeployAscendVaultHype.s.sol # Native-HYPE (ERC-7535) vault + HypeIdleStrategy deployment (env-driven)
+  DeployAscendVaultGuarded.s.sol # GUARDED next-gen ERC-20 vault deployer (env-driven; NOT run on-chain in Phase 2G)
+  DeployAscendVaultHypeGuarded.s.sol # GUARDED next-gen native-HYPE vault deployer (env-driven; NOT run on-chain in Phase 2G)
   DeployIdleStrategy.s.sol # Dedicated IdleStrategy deploy/bind path for an EXISTING vault
   DeployTestAsset.s.sol    # TEST-ONLY mock ERC20 deployer (no documented testnet asset)
 
@@ -101,6 +110,49 @@ How the vault and its strategy interact (implemented in `AscendVault` + `IdleStr
 **Migration.** `exitStrategy()` → `setStrategy(newStrategy)` → `investIdle(...)`. The `StrategyStillInvested` guard makes it impossible to swap or clear a strategy while assets remain invested, so migration cannot strand or lose assets. Total assets are constant through the exit (test: `test_Migration_ExitThenRebindPreservesAssets`).
 
 **No yield.** `IdleStrategy` generates nothing, claims nothing, and depends on no external protocol (no verified yield protocol exists on Kinetiq Elysium testnet). `report()` is always `0` and `harvest()` is a flat no-op. Any future yield-bearing strategy must identify and verify its protocol and addresses on Kinetiq Elysium before being bound.
+
+## Capital controls & emergency model (Phase 2G)
+
+Phase 2G adds explicit, auditable capital controls as **guarded next-generation vaults** — `AscendVaultGuarded` (ERC-20 track) and `AscendVaultHypeGuarded` (native-HYPE track) — implemented as subclasses of the base vaults with NO behavior change to the base sources' existing flows and NO change to the two live deployed vaults. All controls are owner-only, emit events on every state change, and inherit the base contract's settlement checks, reentrancy guards, and fee flows unchanged.
+
+### Control inventory
+
+| Control | Where it lives | Semantics |
+| --- | --- | --- |
+| Vault capacity cap | guarded vaults (`setTotalAssetCap` / `totalAssetCap()`) | Hard ceiling on `totalAssets()` (idle + invested). `0` is the **explicit unbounded state** (default). Forward-looking only: a cap below current totals reverts (`CapBelowTotalAssets` / `HypeCapBelowTotalAssets`) instead of bricking deposits. |
+| Strategy allocation cap | base vaults (`strategy.cap()`, pre-existing) | Enforced atomically in `investIdle` against the vault-side ledger before funds move (`StrategyCapacityExceeded` / `HypeStrategyCapacityExceeded`). Distinct layering: **vault cap = maximum vault capital; strategy cap = maximum capital exposed to one strategy.** Not duplicated. |
+| Deposits pause | guarded vaults (`setDepositsPaused` / `depositsPaused()`) | Blocks `deposit`/`mint` only. **Withdrawals, redeems, and `investIdle` stay open** — a deposit freeze never traps user capital. |
+| Emergency strategy exit | guarded vaults (`emergencyExitStrategy`) | Owner-only, loss-aware: requests the full ledgered amount, accepts whatever the strategy actually returns (real balance delta), keeps the unreturned remainder ledgered, and emits `StrategyForfeited(strategy, settled, loss)` / `HypeStrategyForfeited`. Repeatable to squeeze partial payers. |
+| Strategy abandonment | guarded vaults (`abandonStrategy`) | For strategies whose `divest` reverts outright: zeroes the ledger as an explicit **full loss admission** and frees rebinding. No recovery is faked; late repayments land as idle balance (donation accounting). On the native track the gated `receive()` means an abandoned strategy cannot voluntarily repay later (only forced sends land). |
+
+### Cap enforcement mechanics
+
+- ERC-4626 path (`AscendVaultGuarded`): `maxDeposit`/`maxMint` return the remaining headroom (`cap - totalAssets()`, saturated at 0), so OZ's core `deposit`/`mint` checks revert with the standard `ERC4626ExceededMaxDeposit/Mint`; a defense-in-depth re-check inside the `_deposit` hook (`VaultCapacityExceeded`) covers any future path. Mint-side headroom uses `convertToShares(headroom, Floor)`, which cannot overshoot the cap under OZ's Ceil-cost pricing.
+- Native path (`AscendVaultHypeGuarded`): the base `deposit`/`mint` do not consult `max*`, so enforcement lives in the `_deposit` hook (`HypeVaultCapacityExceeded`; projected total = `totalAssets()` including the already-credited `msg.value`); the overridden `maxDeposit`/`maxMint` views expose the headroom to integrators.
+- Events: `VaultCapUpdated` / `HypeVaultCapUpdated(old, new)` on every cap change; `DepositsPausedUpdated` / `HypeDepositsPausedUpdated` on pause changes. State is publicly readable (`totalAssetCap()`, `depositsPaused()`).
+- Donation edge: forced sends (e.g. `selfdestruct`) still raise `totalAssets()` past the cap without reverting anything — caps gate deposits, not accounting reality (same donation semantics as the base vaults).
+
+### Migration guarantees (unchanged + emergency interplay)
+
+The base migration flow `exitStrategy → setStrategy → investIdle` is untouched: the `StrategyStillInvested` guard still blocks rebinding while the ledger is nonzero, so migration cannot strand assets. The guarded emergency paths compose with it:
+- A **partial** emergency exit keeps the unreturned remainder ledgered → rebinding stays blocked (`StrategyStillInvested`) until the owner recovers the rest (repeat `emergencyExitStrategy`) or explicitly writes it off (`abandonStrategy`).
+- A **full** emergency exit or an abandonment zeroes the ledger → immediate rebinding is possible; the owner can then `investIdle` into the replacement strategy.
+
+### Loss-aware accounting (audit result + new write-down)
+
+Pre-existing (unchanged, test-pinned): `totalAssets()` counts idle balance + the vault-side ledger and never the strategy's self-report, so a lying strategy cannot move the share price; a divest shortfall reverts the whole withdrawal/exit leaving accounting untouched (funds frozen, not mis-counted); over-returns floor the ledger at zero with the extra becoming idle balance.
+
+New in the guarded vaults: an **owner-explicit realized-loss path**. `emergencyExitStrategy` recognizes partial loss at settlement (the `StrategyForfeited` / `HypeStrategyForfeited` event carries `settled` and `loss`), and `abandonStrategy` recognizes total loss. Neither fakes recovery or synthetic yield: the loss shows in `totalAssets()` exactly once, at settlement, and any later voluntary repayment from the (ERC-20 track) strategy arrives as idle balance via donation accounting.
+
+### Deployed-vault limitations (deployment boundary)
+
+- The live vaults `0xa49Ef74F7de5022340bE2f7DeD7bD2c54b344480` (ERC-20) and `0x8C68b40C6c553b41824F6F8d5E995FCBf809B2e7` (native HYPE) are base-vault deployments: they have **no cap, no pause, and no emergency exit**. Only their pre-existing controls apply (strategy cap in `investIdle`, strict settlement checks, migration guard).
+- The Phase 2G changes are source-level `virtual`/helper additions plus the two new guarded subclasses. They **cannot upgrade deployed bytecode** — adopting the controls requires deploying a guarded vault (scripts ready: `DeployAscendVaultGuarded.s.sol` / `DeployAscendVaultHypeGuarded.s.sol`) and migrating users via deposits/withdrawals.
+- **No new on-chain deployment was performed in Phase 2G** (see the deployment record below); no guarded vault exists on chain 99801 yet.
+
+### Risk metadata (registry classes — unchanged)
+
+The registry risk classes (`RISK_LOW` / `RISK_MEDIUM` / `RISK_HIGH` / `RISK_EXPERIMENTAL`) remain protocol classifications, **not** audited or quantitative ratings; no numerical risk score was added. Live control state is derivable on-chain where it actually lives: guarded vaults expose `totalAssetCap()` / `depositsPaused()` (and the base exposes `strategyInvested()`), so integrators read emergency/cap status from the vault itself rather than from registry metadata. Registry entries for the live vault/strategy pairs are unchanged from the Phase 2D record (`RISK_LOW`, metadata `"V1"`).
 
 ## Strategy registry
 
@@ -323,6 +375,10 @@ Target network for this deployment cycle: the **Kinetiq Elysium testnet**.
 > ⚠️ **Contracts are NOT verified on the explorer** — no API exists to submit source programmatically. Reported as-is; do not treat the deployments as verified.
 
 ## Deployment record (Kinetiq Elysium testnet)
+
+### Risk + capital controls (Phase 2G) — source only, no deployment — 2026-10-07
+
+No new contracts were deployed to chain 99801 in this phase. The guarded next-generation vaults (`AscendVaultGuarded`, `AscendVaultHypeGuarded`) and their deploy scripts exist at source level only. The two live vaults remain untouched (code and storage unmodified — re-verified via RPC: both empty with `totalAssets() = 0`, owners `0x550C5DDab8f8D5b57275db3048d9D327Ea748D1b`, strategies bound and uncapped, registry entries `RISK_LOW` / `"V1"` / active). To deploy the guarded vaults later, run the scripts with `--broadcast` after review and record the addresses/txs here.
 
 ### Registry layer: StrategyRegistry + VaultRegistry + live registration — 2026-10-07
 
