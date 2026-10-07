@@ -9,6 +9,8 @@ Professional market-making and strategy-vault protocol foundation for the **Elys
 
 > [!NOTE]
 > **Phase 2G (risk + capital controls):** guarded next-generation vaults (`AscendVaultGuarded`, `AscendVaultHypeGuarded`) add an owner-set total-asset cap (0 = explicit unbounded), a deposits pause (withdrawals/`investIdle` stay open), and a loss-aware emergency strategy exit — see [Capital controls & emergency model](#capital-controls--emergency-model-phase-2g). The two live deployed vaults are base deployments WITHOUT these controls; nothing was redeployed in this phase.
+>
+> **Phase 2I (automation readiness):** a registry-anchored, permissioned `AutomationKeeper` (monitoring reports + idempotent state-changing actions, fail closed) is implemented and tested but NOT deployed — see [Automation readiness](#automation-readiness-phase-2i). No harvest/rebalance logic exists (no live yield strategy on Elysium 99801); those become typed keeper actions only when real strategy capabilities exist.
 
 > ⚠️ **Not audited.** Intended for Elysium testnet first. Fees are disabled by default. `IdleStrategy` / `HypeIdleStrategy` never move funds on their own and never fabricate yield; only the vault owner routes assets into them.
 
@@ -22,6 +24,8 @@ src/
   AscendVaultHype.sol      # Native-HYPE track: ERC-7535 vault (msg.value deposits, same strategy-layer design)
   AscendVaultGuarded.sol   # ERC-20 track, GUARDED (Phase 2G): total-asset cap, deposits pause, loss-aware emergency exit
   AscendVaultHypeGuarded.sol # Native-HYPE track, GUARDED (Phase 2G): same controls over the ERC-7535 base
+  automation/
+    AutomationKeeper.sol   # Phase 2I: registry-anchored keeper (monitoring reports + permissioned idempotent actions; NOT deployed)
   StrategyRegistry.sol     # Owner-controlled allowlist of approved strategies (both tracks) with risk/version metadata
   VaultRegistry.sol        # Owner-controlled directory of vaults (asset, strategy, risk class, active flag)
   interfaces/
@@ -38,6 +42,7 @@ test/
   AscendVault.t.sol        # ERC-20 vault suite (deployment, accounting, fees, strategy binding, access)
   AscendVaultGuarded.t.sol # Guarded ERC-20 suite (cap, pause, emergency exit, migration invariants) — 31 tests
   AscendVaultHypeGuarded.t.sol # Guarded native-HYPE suite (same coverage) — 30 tests
+  AutomationKeeper.t.sol   # Phase 2I keeper suite (both tracks: auth, dedupe, idempotency, probing, reports, failed calls) — 59 tests
   StrategyVault.t.sol      # ERC-20 strategy-layer suite (invest/divest flows, migration, adversarial strategies)
   HypeVault.t.sol          # Native-HYPE suites: HypeVaultTest (32) + HypeIdleStrategyTest (5)
   KinetiqLstStrategy.t.sol # Kinetiq adapter suites: KinetiqStrategyTest (34) + KinetiqVaultLifecycleTest (11, full AscendVaultHype lifecycle)
@@ -55,6 +60,7 @@ script/
   DeployAscendVaultHype.s.sol # Native-HYPE (ERC-7535) vault + HypeIdleStrategy deployment (env-driven)
   DeployAscendVaultGuarded.s.sol # GUARDED next-gen ERC-20 vault deployer (env-driven; NOT run on-chain in Phase 2G)
   DeployAscendVaultHypeGuarded.s.sol # GUARDED next-gen native-HYPE vault deployer (env-driven; NOT run on-chain in Phase 2G)
+  DeployAutomationKeeper.s.sol # Phase 2I keeper deployer (env-driven; NOT run on-chain in Phase 2I)
   DeployIdleStrategy.s.sol # Dedicated IdleStrategy deploy/bind path for an EXISTING vault
   DeployTestAsset.s.sol    # TEST-ONLY mock ERC20 deployer (no documented testnet asset)
 
@@ -153,6 +159,38 @@ New in the guarded vaults: an **owner-explicit realized-loss path**. `emergencyE
 ### Risk metadata (registry classes — unchanged)
 
 The registry risk classes (`RISK_LOW` / `RISK_MEDIUM` / `RISK_HIGH` / `RISK_EXPERIMENTAL`) remain protocol classifications, **not** audited or quantitative ratings; no numerical risk score was added. Live control state is derivable on-chain where it actually lives: guarded vaults expose `totalAssetCap()` / `depositsPaused()` (and the base exposes `strategyInvested()`), so integrators read emergency/cap status from the vault itself rather than from registry metadata. Registry entries for the live vault/strategy pairs are unchanged from the Phase 2D record (`RISK_LOW`, metadata `"V1"`).
+
+## Automation readiness (Phase 2I)
+
+`src/automation/AutomationKeeper.sol` is a lightweight, registry-anchored automation layer. **It is implemented and fully tested but NOT deployed** — it becomes deployable the moment automated operations are actually needed (which, with no live yield strategy on Elysium 99801, is not yet). There is **no fabricated harvest/rebalance logic**: automation today is monitoring plus the state-changing actions the current contracts genuinely support.
+
+### Monitoring (pure reads; every value derived on-chain)
+
+- `vaultReport(vault)` — registration, active flag, asset, `totalAssets()`, bound strategy, `strategyInvested()`, cap support + configured cap (`0` = unbounded), deposits-paused state, and a bitmask of anomaly flags. Cap utilization is directly computable as `totalAssets / totalAssetCap` from the returned inputs (nothing is pre-computed on-chain).
+- `strategyReport(strategy)` — registration, active flag, recorded vault/asset, cap, the strategy's self-reported `totalAssets()`, and the vault-side ledger (`strategyInvested()`).
+- Flags (all defensive reads, no pricing impact): `FLAG_VAULT_INACTIVE`, `FLAG_STRATEGY_NOT_REGISTERED`, `FLAG_STRATEGY_INACTIVE`, `FLAG_STRATEGY_VAULT_MISMATCH`, `FLAG_STRATEGY_ASSET_MISMATCH`, `FLAG_OVER_CAP`, `FLAG_DEPOSITS_PAUSED`, `FLAG_STRATEGY_BALANCE_DIVERGENCE` (self-report below the vault ledger — informational only, never used for pricing). The two MISMATCH flags are defense-in-depth: with the current immutable-binding strategies + validated registrations they are unreachable through sanctioned flows (both the vault's `setStrategy` and registration enforce the same invariants) — they watch for out-of-band registry desync.
+- The keeper's source of protocol truth is the two registries + the contracts themselves (direct Elysium RPC reads). No off-chain database is involved.
+
+### Actions (typed, permissioned, idempotent, fail closed)
+
+Every action carries a caller-chosen `actionId` (zero rejected): each id resolves exactly once — a second submission reverts `DuplicateAction`. State-targeting actions are additionally idempotent: when the target is already in the requested state the keeper emits `ActionNoOp` instead of re-executing (the id is consumed either way — one request, one resolution). A reverted execution rolls the marking back, so failed actions stay retryable under the same id.
+
+| Action | Target surface | Semantics |
+| --- | --- | --- |
+| `setVaultDepositsPaused` | guarded vaults only (capability-probed; base vaults revert `ActionNotSupported`) | deposits pause on/off; idempotent at same state |
+| `setVaultTotalAssetCap` | guarded vaults only | set cap (`0` = unbounded); idempotent at same value; a cap below current totals surfaces the vault's `CapBelowTotalAssets` and stays retryable |
+| `vaultEmergencyExitStrategy` | guarded vaults only | the vault's loss-aware emergency exit (partial settle → repeatable squeeze; `NothingInvested` reverts stay retryable) |
+| `vaultInvestIdle` | all tracks | invest idle assets into the bound strategy (zero amounts rejected) |
+| `vaultExitStrategy` | all tracks | pull the full ledger back to idle; explicit `ActionNoOp` when nothing is invested |
+| `setStrategyEntryActive` / `setVaultEntryActive` | registries | incident-response activation/deactivation; idempotent at same state |
+
+**Permission model (two layers):**
+1. The keeper itself: only the admin (owner) and explicitly authorized keepers (`setKeeper`) may submit actions; unauthorized calls revert `NotKeeper` and consume nothing.
+2. The targets: every underlying function remains owner-only on the vault/registry. A keeper action executes successfully only after the protocol owner **delegates** the target's admin rights to the keeper (plain OZ `Ownable` one-step `transferOwnership(address(keeper))` — the vaults/registries in this repo are single-step). Until then every underlying call reverts and the actionId stays unused (fail closed; the keeper never bypasses a target's own authorization).
+
+Events: `KeeperUpdated(keeper, authorized)`, `ActionExecuted(actionId, actionType, target, caller)` alongside the target contract's own state event (e.g. `DepositsPausedUpdated`), and `ActionNoOp` for idempotent resolutions. The keeper never moves user funds, never holds allowances, and has **no** generic `execute(target, calldata)` escape hatch — every action is a typed function, so the blast radius is exactly the actions above. `harvest`/`rebalance` do NOT exist as actions: no live yield strategy exists on Elysium 99801, and the Kinetiq kHYPE adapter remains **inactive and unregistered**. When a real yield strategy ships and its contract capabilities are verified, typed actions for it are added here against the strategy's real surface (fail closed), using the same idempotency ledger and permission model.
+
+**Deployment status:** NOT deployed. `script/DeployAutomationKeeper.s.sol` is source-ready, env-driven (`KEEPER_ADMIN`, registry anchor overrides), and dry-run only. It is only required when automated operations actually begin on chain 99801.
 
 ## Strategy registry
 

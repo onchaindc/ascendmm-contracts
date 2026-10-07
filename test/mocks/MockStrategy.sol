@@ -34,6 +34,13 @@ contract MockStrategy is IStrategy {
         _reportedProfit = profit;
     }
 
+    /// @notice TEST-ONLY: remove tokens from the mock (simulates a strategy
+    ///         becoming undercollateralized) so the keeper's informational
+    ///         balance-divergence monitoring has a real on-chain condition.
+    function drain(uint256 amount, address to) external {
+        SafeERC20.safeTransfer(_asset, to, amount);
+    }
+
     function invest(uint256 assets) external payable {
         SafeERC20.safeTransferFrom(_asset, msg.sender, address(this), assets);
         emit Invested(assets);
